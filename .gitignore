@@ -1,0 +1,16 @@
+# secrets & local state
+*.env
+.env
+inem.env
+/data/
+*.pem
+*.key
+
+# build artifacts
+bin/
+*.exe
+whisper.cpp/
+
+# go
+*.test
+coverage.out
