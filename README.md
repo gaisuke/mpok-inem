@@ -74,8 +74,9 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | POST | `/internal/v1/handle` | uniform entry contract (PRD TRD §4.2) |
 | GET/POST | `/v1/pockets` | list / create pockets |
 | POST | `/v1/transactions` | record a transaction |
+| GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `limit`) |
 | POST | `/v1/transfers` | move money between pockets |
-| GET | `/v1/expense/summary` | balances and spend summary |
+| GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
 | POST/GET | `/v1/notes` | capture / list notes |
 | GET | `/v1/notes/search`, `/v1/notes/{id}` | search, fetch one |
 | POST | `/v1/meals`, GET `/v1/nutrition/daily` | log a meal / daily rollup |

@@ -234,18 +234,47 @@ func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 	writeJSON(w, 201, map[string]any{"id": id})
 }
 
-// summary: month rollup by category + pocket balances
+// summary: category rollup + totals for a period (month, or from/to) + pocket balances
 func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
-	month := time.Now().Format("2006-01")
-	if m := r.URL.Query().Get("month"); m != "" {
-		if _, err := time.Parse("2006-01", m); err != nil {
+	q := r.URL.Query()
+	month, from, to := q.Get("month"), q.Get("from"), q.Get("to")
+	switch {
+	case from != "" || to != "":
+		today := time.Now().Format("2006-01-02")
+		if from == "" {
+			from = today
+		}
+		if to == "" {
+			to = today
+		}
+		for _, d := range []struct{ name, val string }{{"from", from}, {"to", to}} {
+			if _, err := time.Parse("2006-01-02", d.val); err != nil {
+				badReq(w, d.name+" must be YYYY-MM-DD")
+				return
+			}
+		}
+		if to < from {
+			badReq(w, "to must not be before from")
+			return
+		}
+		month = ""
+	default:
+		if month == "" {
+			month = time.Now().Format("2006-01")
+		}
+		if _, err := time.Parse("2006-01", month); err != nil {
 			badReq(w, "month must be YYYY-MM")
 			return
 		}
-		month = m
 	}
+
+	where, args := "to_char(created_at,'YYYY-MM')=$2", []any{userID, month}
+	if month == "" {
+		where, args = "created_at::date BETWEEN $2::date AND $3::date", []any{userID, from, to}
+	}
+
 	rows, err := db.Query(`SELECT category, direction, SUM(amount) FROM expense.transactions
-		WHERE user_id=$1 AND to_char(created_at,'YYYY-MM')=$2 GROUP BY category, direction ORDER BY 3 DESC`, userID, month)
+		WHERE user_id=$1 AND `+where+` GROUP BY category, direction ORDER BY 3 DESC`, args...)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -257,6 +286,7 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 		TotalIDR int64 `json:"total_idr"`
 	}
 	cats := []cat{}
+	var totalOut, totalIn int64
 	for rows.Next() {
 		var c cat
 		if err := rows.Scan(&c.Category, &c.Direction, &c.TotalIDR); err != nil {
@@ -264,6 +294,11 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 			return
 		}
 		cats = append(cats, c)
+		if c.Direction == "out" {
+			totalOut += c.TotalIDR
+		} else {
+			totalIn += c.TotalIDR
+		}
 	}
 	pockets := []pocket{}
 	prows, err := db.Query(balanceSQL, userID)
@@ -276,7 +311,96 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"month": month, "by_category": cats, "pockets": pockets})
+	resp := map[string]any{
+		"by_category": cats, "pockets": pockets,
+		"total_out_idr": totalOut, "total_in_idr": totalIn,
+	}
+	if month != "" {
+		resp["month"] = month
+	} else {
+		resp["from"], resp["to"] = from, to
+	}
+	writeJSON(w, 200, resp)
+}
+
+// listTxns: transactions for a period, newest first (detail behind a summary)
+func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
+	q := r.URL.Query()
+	limit := 50
+	if l := q.Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n <= 0 || n > 500 {
+			badReq(w, "limit must be 1..500")
+			return
+		}
+		limit = n
+	}
+	where, args := "t.user_id=$1", []any{userID}
+	from, to := q.Get("from"), q.Get("to")
+	if from != "" || to != "" {
+		if from == "" {
+			from = to
+		}
+		if to == "" {
+			to = from
+		}
+		for _, d := range []struct{ name, val string }{{"from", from}, {"to", to}} {
+			if _, err := time.Parse("2006-01-02", d.val); err != nil {
+				badReq(w, d.name+" must be YYYY-MM-DD")
+				return
+			}
+		}
+		if to < from {
+			badReq(w, "to must not be before from")
+			return
+		}
+		where += " AND t.created_at::date BETWEEN $2::date AND $3::date"
+		args = append(args, from, to)
+	}
+	if c := q.Get("category"); c != "" {
+		args = append(args, c)
+		where += fmt.Sprintf(" AND t.category=$%d", len(args))
+	}
+	if d := q.Get("direction"); d != "" {
+		if d != "in" && d != "out" {
+			badReq(w, "direction must be in|out")
+			return
+		}
+		args = append(args, d)
+		where += fmt.Sprintf(" AND t.direction=$%d", len(args))
+	}
+	args = append(args, limit)
+	rows, err := db.Query(fmt.Sprintf(`SELECT t.id, t.pocket_id, p.name, t.direction, t.amount, t.category,
+		COALESCE(t.note,''), t.created_at
+		FROM expense.transactions t JOIN expense.pockets p ON p.id=t.pocket_id
+		WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	type txn struct {
+		ID       int64  `json:"id"`
+		PocketID int    `json:"pocket_id"`
+		Pocket   string `json:"pocket"`
+		Direction string `json:"direction"`
+		AmountIDR int64 `json:"amount_idr"`
+		Category string `json:"category"`
+		Note     string `json:"note"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := []txn{}
+	for rows.Next() {
+		var t txn
+		var ts time.Time
+		if err := rows.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &ts); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		t.CreatedAt = ts.Format(time.RFC3339)
+		out = append(out, t)
+	}
+	writeJSON(w, 200, out)
 }
 
 // ---------- brain ----------
@@ -518,6 +642,7 @@ func main() {
 	mux.HandleFunc("GET /v1/pockets", withUser(func(w http.ResponseWriter, r *http.Request, uid int) { getPockets(w, uid) }))
 	mux.HandleFunc("POST /v1/pockets", withUser(createPocket))
 	mux.HandleFunc("POST /v1/transactions", withUser(createTxn))
+	mux.HandleFunc("GET /v1/transactions", withUser(listTxns))
 	mux.HandleFunc("POST /v1/transfers", withUser(createTransfer))
 	mux.HandleFunc("GET /v1/expense/summary", withUser(expenseSummary))
 
