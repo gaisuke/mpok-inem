@@ -54,6 +54,18 @@ Listens on `127.0.0.1:8777` (override with `INEM_ADDR`). Health check:
 
     curl http://127.0.0.1:8777/healthz
 
+Domain routes require an `X-User-ID` header (the caller — Hermes — resolves the
+Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
+`user_id` in the body instead.
+
+### Deploying as a service
+
+    sudo cp deploy/inemd.service /etc/systemd/system/
+    sudo cp deploy/inem.env.example /etc/inem.env   # then edit the DSN
+    sudo chmod 600 /etc/inem.env
+    sudo systemctl daemon-reload && sudo systemctl enable --now inemd
+    journalctl -u inemd -f
+
 ### Endpoints
 
 | Method | Path | Purpose |

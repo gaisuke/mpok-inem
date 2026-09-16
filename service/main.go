@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	pq "github.com/lib/pq" // driver; pq.Array for text[] columns
 )
 
 var db *sql.DB
@@ -292,7 +292,7 @@ type note struct {
 func scanNote(s interface{ Scan(...any) error }) (note, error) {
 	var n note
 	var t time.Time
-	err := s.Scan(&n.ID, &n.Title, &n.BodyMD, &n.Tags, &t)
+	err := s.Scan(&n.ID, &n.Title, &n.BodyMD, pq.Array(&n.Tags), &t)
 	n.Updated = t.Format(time.RFC3339)
 	return n, err
 }
@@ -313,7 +313,7 @@ func createNote(w http.ResponseWriter, r *http.Request, userID int) {
 	}
 	var n note
 	err := db.QueryRow(`INSERT INTO brain.notes(user_id,title,body_md,tags) VALUES($1,$2,$3,$4)
-		RETURNING id,title,body_md,tags,updated_at`, userID, in.Title, in.BodyMD, in.Tags).Scan(&n.ID, &n.Title, &n.BodyMD, &n.Tags, &n.Updated)
+		RETURNING id,title,body_md,tags,updated_at`, userID, in.Title, in.BodyMD, pq.Array(in.Tags)).Scan(&n.ID, &n.Title, &n.BodyMD, pq.Array(&n.Tags), &n.Updated)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -324,7 +324,7 @@ func createNote(w http.ResponseWriter, r *http.Request, userID int) {
 func getNote(w http.ResponseWriter, r *http.Request, userID int, id int) {
 	var n note
 	err := db.QueryRow(`SELECT id,title,body_md,tags,updated_at FROM brain.notes WHERE id=$1 AND user_id=$2`, id, userID).
-		Scan(&n.ID, &n.Title, &n.BodyMD, &n.Tags, &n.Updated)
+		Scan(&n.ID, &n.Title, &n.BodyMD, pq.Array(&n.Tags), &n.Updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		badReq(w, "note not found")
 		return
