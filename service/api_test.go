@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -45,16 +47,26 @@ func conn(t *testing.T) *sql.DB {
 			noDB = true
 			return
 		}
-		schema, err := os.ReadFile("../db/001_init.sql")
-		if err != nil {
-			fmt.Printf("cannot read schema: %v\n", err)
+		// apply every migration in order, so a fresh test database matches production
+		files, err := filepath.Glob("../db/*.sql")
+		if err != nil || len(files) == 0 {
+			fmt.Printf("cannot list schema files: %v\n", err)
 			noDB = true
 			return
 		}
-		if _, err := c.Exec(string(schema)); err != nil {
-			fmt.Printf("cannot apply schema: %v\n", err)
-			noDB = true
-			return
+		sort.Strings(files)
+		for _, f := range files {
+			schema, err := os.ReadFile(f)
+			if err != nil {
+				fmt.Printf("cannot read %s: %v\n", f, err)
+				noDB = true
+				return
+			}
+			if _, err := c.Exec(string(schema)); err != nil {
+				fmt.Printf("cannot apply %s: %v\n", f, err)
+				noDB = true
+				return
+			}
 		}
 		testConn = c
 	})
@@ -940,6 +952,52 @@ func TestPocketSharingIsReadOnlyAndOptIn(t *testing.T) {
 	}
 	a.want("PATCH", fmt.Sprintf("/v1/pockets/%d", mine), map[string]any{"visibility": "public"}, 400)
 	a.want("POST", "/v1/pockets", map[string]any{"name": "X", "visibility": "public"}, 400)
+}
+
+// A member's scope decides which features they get (the dashboard hides the
+// notes and nutrition tabs for a finance-only member), so it has to be readable
+// by the member themselves and by the household roster.
+func TestMemberScopeAndIdentity(t *testing.T) {
+	a := newAPI(t)
+
+	me := a.obj("GET", "/v1/me", nil, 200)
+	if me["display_name"] != "Test Dani" || me["scope"] != "full" || int(me["user_id"].(float64)) != a.uid {
+		t.Fatalf("me should describe the caller: %v", me)
+	}
+
+	created := a.obj("POST", "/v1/admin/users", map[string]any{
+		"telegram_user_id": 1149698493, "display_name": "Pipit", "scope": "finance"}, 201)
+	if created["scope"] != "finance" {
+		t.Fatalf("created member should carry the scope: %v", created)
+	}
+	her := int(created["user_id"].(float64))
+	if code, raw := a.req("GET", "/v1/me", nil, her, true); code != 200 || !bodyContains(raw, `"scope":"finance"`) {
+		t.Fatalf("her own view should say finance: %d %s", code, raw)
+	}
+
+	roster := a.list("GET", "/v1/admin/users", 200)
+	var hers map[string]any
+	for _, m := range roster {
+		if int(m.(map[string]any)["id"].(float64)) == her {
+			hers = m.(map[string]any)
+		}
+	}
+	if hers == nil || hers["scope"] != "finance" || hers["telegram_user_id"].(float64) != 1149698493 {
+		t.Fatalf("roster should report each member's scope: %v", roster)
+	}
+
+	// an unknown scope is rejected instead of being stored, and the default holds
+	a.want("POST", "/v1/admin/users", map[string]any{
+		"telegram_user_id": 5, "display_name": "X", "scope": "nutrition"}, 400)
+	def := a.obj("POST", "/v1/admin/users", map[string]any{
+		"telegram_user_id": 6, "display_name": "Y"}, 201)
+	if def["scope"] != "full" {
+		t.Fatalf("scope should default to full: %v", def)
+	}
+
+	if code, _ := a.req("GET", "/v1/me", nil, 99999, true); code != 404 {
+		t.Fatalf("unknown member should be 404, got %d", code)
+	}
 }
 
 func TestAuthHeaderAndCrossUserIsolation(t *testing.T) {

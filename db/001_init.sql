@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS inem_auth.users (
   id                serial PRIMARY KEY,
   telegram_user_id  bigint UNIQUE NOT NULL,
   display_name      text NOT NULL,
+  scope             text NOT NULL DEFAULT 'full'
+                    CHECK (scope IN ('full','finance')),
   created_at        timestamptz NOT NULL DEFAULT now()
 );
 

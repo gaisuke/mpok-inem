@@ -132,3 +132,26 @@ explicitly. The rules that keep this from leaking:
   (`403`) and `/v1/household` (which returns shared pockets only, per member).
 - `GET /v1/transactions?pocket_id=` scopes by pocket *after* the access check
   rather than by `user_id`, because a shared pocket's rows belong to its owner.
+
+## D7 — Member scope decides which features a member gets (2026-09-20)
+
+- **Scope lives on the member, not in the browser.** `inem_auth.users.scope`
+  (`full` | `finance`) is readable by the member themselves (`GET /v1/me`) and by
+  the household roster; the dashboard asks inemd who the caller is and hides the
+  notes and nutrition tabs for a `finance` member. Nothing the page sends is
+  trusted for this — the same rule as every other authorization decision.
+- **Why a column and not a config flag:** his wife's account is money-only *for
+  now* ("belum punya fitur itu"), and that is a fact about her membership, not
+  about one UI. When her scope changes it is one `UPDATE`, and her agent profile
+  (finance-only skill, finance-only SOUL) matches it.
+- **Hidden is not forbidden.** The tabs disappear, but the underlying endpoints
+  stay authorized by `user_id` as always — the UI is a convenience, never the
+  boundary. A finance member who curls `/v1/notes` still only ever sees their own.
+- **Fail visible, not silent.** If `/v1/me` cannot be reached the dashboard falls
+  back to showing every tab rather than guessing `finance`, so a broken lookup
+  cannot quietly hide features from the wrong person.
+- **Pitfall recorded:** an author CSS `display` rule (e.g. `#login { display:flex }`)
+  beats the browser's `[hidden]` rule, so `hidden = true` silently does nothing.
+  Any element hidden via the attribute now carries an explicit `[hidden]` rule,
+  and verification checks the *computed* style — the earlier check read the
+  attribute and passed while the overlay covered the page.

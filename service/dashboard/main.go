@@ -144,13 +144,31 @@ func (s *server) authed(next func(w http.ResponseWriter, r *http.Request, id ide
 
 func (s *server) whoami(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resolve(r)
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"authenticated":  ok,
 		"user_id":        id.UserID,
 		"display_name":   id.Name,
 		"via":            id.Via,
 		"password_login": s.passwd != "",
-	})
+		"scope":          "",
+	}
+	// Which tabs to show is a property of the member, not of the browser: ask
+	// inemd who this is rather than trusting anything the page sent.
+	if ok {
+		if body, code, err := s.get(r, "/v1/me", id.UserID); err == nil && code == http.StatusOK {
+			var me struct {
+				DisplayName string `json:"display_name"`
+				Scope       string `json:"scope"`
+			}
+			if json.Unmarshal(body, &me) == nil {
+				if me.DisplayName != "" {
+					out["display_name"] = me.DisplayName
+				}
+				out["scope"] = me.Scope
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // authTelegram takes the Mini App initData, has the gate check Telegram's

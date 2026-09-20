@@ -1210,6 +1210,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		TelegramUserID int64  `json:"telegram_user_id"`
 		DisplayName    string `json:"display_name"`
+		Scope          string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1223,23 +1224,31 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		badReq(w, "display_name required")
 		return
 	}
+	if in.Scope == "" {
+		in.Scope = "full"
+	}
+	if in.Scope != "full" && in.Scope != "finance" {
+		badReq(w, "scope must be full|finance")
+		return
+	}
 	var id int
-	var name string
-	err := db.QueryRow(`INSERT INTO inem_auth.users(telegram_user_id,display_name) VALUES($1,$2)
-		ON CONFLICT (telegram_user_id) DO UPDATE SET display_name=EXCLUDED.display_name
-		RETURNING id, display_name`, in.TelegramUserID, in.DisplayName).Scan(&id, &name)
+	var name, scope string
+	err := db.QueryRow(`INSERT INTO inem_auth.users(telegram_user_id,display_name,scope) VALUES($1,$2,$3)
+		ON CONFLICT (telegram_user_id) DO UPDATE SET display_name=EXCLUDED.display_name, scope=EXCLUDED.scope
+		RETURNING id, display_name, scope`, in.TelegramUserID, in.DisplayName, in.Scope).Scan(&id, &name, &scope)
 	if err != nil {
 		badReq(w, err.Error())
 		return
 	}
 	var pockets int
 	_ = db.QueryRow(`SELECT count(*) FROM expense.pockets WHERE user_id=$1`, id).Scan(&pockets)
-	writeJSON(w, 201, map[string]any{"user_id": id, "display_name": name, "pockets": pockets})
+	writeJSON(w, 201, map[string]any{"user_id": id, "display_name": name, "scope": scope, "pockets": pockets})
 }
 
-// listUsers: the household roster (who is linked, and how many pockets each has).
+// listUsers: the household roster (who is linked, what their account covers, and
+// how many pockets each has).
 func listUsers(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(`SELECT u.id, u.telegram_user_id, u.display_name,
+	rows, err := db.Query(`SELECT u.id, u.telegram_user_id, u.display_name, u.scope,
 		(SELECT count(*) FROM expense.pockets p WHERE p.user_id=u.id)
 		FROM inem_auth.users u ORDER BY u.id`)
 	if err != nil {
@@ -1251,18 +1260,37 @@ func listUsers(w http.ResponseWriter, r *http.Request) {
 		ID             int    `json:"id"`
 		TelegramUserID int64  `json:"telegram_user_id"`
 		DisplayName    string `json:"display_name"`
+		Scope          string `json:"scope"`
 		Pockets        int    `json:"pockets"`
 	}
 	out := []member{}
 	for rows.Next() {
 		var m member
-		if err := rows.Scan(&m.ID, &m.TelegramUserID, &m.DisplayName, &m.Pockets); err != nil {
+		if err := rows.Scan(&m.ID, &m.TelegramUserID, &m.DisplayName, &m.Scope, &m.Pockets); err != nil {
 			badReq(w, err.Error())
 			return
 		}
 		out = append(out, m)
 	}
 	writeJSON(w, 200, out)
+}
+
+// me: the caller's own identity — what the dashboard needs to know which
+// features to show without trusting anything the browser sent.
+func me(w http.ResponseWriter, r *http.Request, userID int) {
+	var id int
+	var name, scope string
+	err := db.QueryRow(`SELECT id, display_name, scope FROM inem_auth.users WHERE id=$1`, userID).
+		Scan(&id, &name, &scope)
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "user not found")
+		return
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"user_id": id, "display_name": name, "scope": scope})
 }
 
 // deleteUser removes a member and every row they own (the scope=all wipe, then
@@ -1743,6 +1771,7 @@ func allRoutes() []route {
 
 		{"POST", "/v1/admin/reset", withUser(resetData)},
 		{"GET", "/v1/admin/users", listUsers},
+		{"GET", "/v1/me", withUser(me)},
 		{"POST", "/v1/admin/users", createUser},
 		{"DELETE", "/v1/admin/users/{id}", withUserID(deleteUser)},
 

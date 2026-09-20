@@ -199,6 +199,21 @@ func TestWhoami(t *testing.T) {
 	}
 }
 
+// The dashboard offers tabs based on the member's scope, and it must learn that
+// from inemd — never from anything the page sent.
+func TestWhoamiCarriesMemberScope(t *testing.T) {
+	f := &fakeInemd{body: `{"user_id":12,"display_name":"Pipit","scope":"finance"}`}
+	h := dash(t, f, &fakeGate{}).handler()
+
+	code, body := get(t, h, "/api/whoami", goodToken)
+	if code != 200 || !strings.Contains(body, `"scope":"finance"`) || !strings.Contains(body, "Pipit") {
+		t.Fatalf("whoami should carry the member's scope: %d %s", code, body)
+	}
+	if f.path != "/v1/me" || f.user != "7" {
+		t.Fatalf("whoami should ask inemd who the caller is: path=%s user=%s", f.path, f.user)
+	}
+}
+
 // ---------- login ----------
 
 func TestAuthTelegram(t *testing.T) {

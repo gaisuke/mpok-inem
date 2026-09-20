@@ -90,7 +90,8 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | PATCH/DELETE | `/v1/meals/{id}` | fix or drop a meal |
 | GET | `/v1/nutrition/daily` | daily macro rollup (`day`) |
 | GET/PUT/DELETE | `/v1/nutrition/target` | read / set / clear a daily calorie+protein target |
-| GET/POST | `/v1/admin/users` | household roster / link a member |
+| GET/POST | `/v1/admin/users` | household roster / link a member (`scope`: full\|finance) |
+| GET | `/v1/me` | who am I: id, display name, scope |
 | DELETE | `/v1/admin/users/{id}` | unlink a member and wipe their rows |
 | POST | `/v1/admin/reset` | wipe a user's data: `{"confirm":"RESET","scope":"ledger"\|"all"}` |
 
