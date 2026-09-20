@@ -15,6 +15,15 @@
   header { padding: 14px 16px 0; max-width: 820px; margin: 0 auto; }
   h1 { margin: 0; font-size: 18px; letter-spacing: .2px; }
   h1 small { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  #who { color: var(--dim); font-size: 12.5px; float: right; }
+  #who a { color: var(--accent); text-decoration: none; margin-left: 8px; }
+  #login { position: fixed; inset: 0; background: rgba(15,17,21,.97); display: flex;
+    align-items: center; justify-content: center; padding: 20px; z-index: 10; }
+  .loginbox { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 22px; max-width: 380px; width: 100%; }
+  .loginbox h2 { margin-top: 0; }
+  .loginbox p { color: var(--dim); font-size: 13.5px; }
+  .loginbox input { width: 100%; margin-bottom: 8px; }
   .tabs { display: flex; gap: 6px; overflow-x: auto; padding: 12px 0 0; }
   .tabs button { background: var(--card); color: var(--dim); border: 1px solid var(--line);
     border-radius: 999px; padding: 7px 14px; font-size: 13px; white-space: nowrap; }
@@ -61,7 +70,7 @@
 </head>
 <body>
 <header>
-  <h1>Mpok Inem <small id="stamp"></small></h1>
+  <h1>Mpok Inem <small id="stamp"></small><span id="who"></span></h1>
   <div class="tabs" role="tablist">
     <button data-tab="ringkasan" aria-selected="true">Ringkasan</button>
     <button data-tab="transaksi">Transaksi</button>
@@ -69,6 +78,17 @@
     <button data-tab="meals">Meals</button>
   </div>
 </header>
+<div id="login" hidden>
+  <div class="loginbox">
+    <h2>Masuk</h2>
+    <p id="login-msg">Buka dashboard ini dari tombol menu di bot Telegram — identitasmu diperiksa Telegram, tidak perlu password.</p>
+    <form id="login-form" hidden>
+      <input id="login-user" placeholder="user" autocomplete="username">
+      <input id="login-pass" type="password" placeholder="password" autocomplete="current-password">
+      <button class="act" type="submit">Masuk</button>
+    </form>
+  </div>
+</div>
 <main>
   <section id="ringkasan" class="active">
     <div class="row">
@@ -329,7 +349,71 @@ $('notes-list').addEventListener('click', async (e) => {
 
 $('meal-day').value = new Date().toLocaleDateString('sv-SE'); // local YYYY-MM-DD
 $('stamp').textContent = 'read-only · ' + new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
-showTab('ringkasan');
+
+// ---- auth: Telegram signs who opened this page (no password needed) ----
+// Telegram opens a Mini App with the signed payload in the URL hash, so the
+// page needs no external SDK script and works even if that CDN is unreachable.
+function initDataFromHash() {
+  const h = new URLSearchParams(location.hash.replace(/^#/, ''));
+  return h.get('tgWebAppData') ||
+    (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) || '';
+}
+
+function showLogin(msg, passwordLogin) {
+  $('login').hidden = false;
+  if (msg) $('login-msg').textContent = msg;
+  if (passwordLogin) $('login-form').hidden = false;
+}
+
+function afterLogin(w) {
+  $('login').hidden = true;
+  $('who').innerHTML = esc(w.display_name || '') + ' <a href="' + BASE + '/auth/logout">keluar</a>';
+  showTab('ringkasan');
+}
+
+async function loginWithTelegram(initData) {
+  try {
+    const res = await fetch(BASE + '/auth/telegram', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: initData }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) return showLogin(out.error || 'Login gagal (' + res.status + ')', true);
+    location.replace(location.pathname + location.search); // drop initData from the URL
+  } catch (e) {
+    showLogin('Tidak bisa menghubungi server: ' + e.message, true);
+  }
+}
+
+async function boot() {
+  let w = null;
+  try { w = await api('/api/whoami'); } catch (e) { /* shown below */ }
+  if (w && w.authenticated) return afterLogin(w);
+  const initData = initDataFromHash();
+  if (initData) return loginWithTelegram(initData);
+  showLogin(w && w.password_login
+    ? 'Buka dari tombol menu bot Telegram, atau masuk dengan password.'
+    : 'Buka dashboard ini dari tombol menu di bot Telegram.', w && w.password_login);
+}
+
+$('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const res = await fetch(BASE + '/auth/password', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: $('login-user').value, password: $('login-pass').value }),
+    });
+    if (!res.ok) {
+      const out = await res.json().catch(() => ({}));
+      return showLogin(out.error || 'Password salah', true);
+    }
+    location.replace(location.pathname + location.search);
+  } catch (err) {
+    showLogin('Gagal masuk: ' + err.message, true);
+  }
+});
+
+boot();
 </script>
 </body>
 </html>

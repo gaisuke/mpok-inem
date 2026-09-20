@@ -128,12 +128,38 @@ notes with search/tag filter, and meals with macros + daily target. Tapping a
 pocket opens that pocket's own ledger (`/api/pocket`, which merges the pocket,
 its entries and the transfers in/out of it into one response).
 
+Login is a Telegram Mini App: the bot's menu button opens the page with
+Telegram's signed `initData` in the URL hash, inemdash forwards it to inemgate,
+and the verified telegram id decides *whose* data is served (no shared login, no
+password). `GET /api/whoami`, `POST /auth/telegram`, `POST /auth/password`
+(break-glass, only when configured) and `GET /auth/logout` are the only
+non-GET routes — none of them can reach inemd, so the data path stays read-only.
+
 - No write path exists in the binary — only GET routes are registered, so every
   POST/PATCH/DELETE answers 405 and never reaches inemd.
-- `INEM_WEB_ADDR` (default `127.0.0.1:8090`), `INEM_WEB_USER` (internal user id),
-  `INEM_WEB_AUTH_PASS` (HTTP basic auth; unset = no auth, so only bind localhost
-  or put TLS+auth in front). Deployed as `deploy/inemdash.service` with
-  `/etc/inem-dash.env`; nginx proxies `https://danimunf.duckdns.org/inem/` to it.
+- `INEM_WEB_ADDR` (default `127.0.0.1:8090`), `INEM_GATE_BASE`
+  (default `http://127.0.0.1:8778`), `INEM_WEB_USER` + `INEM_WEB_AUTH_USER` /
+  `INEM_WEB_AUTH_PASS` for the break-glass password. Deployed as
+  `deploy/inemdash.service` with `/etc/inem-dash.env`; nginx proxies
+  `https://danimunf.duckdns.org/inem/` to it.
+
+## Telegram identity (inemgate)
+
+`service/inemgate` is the only process holding `TELEGRAM_BOT_TOKEN`. It verifies
+the Mini App `initData` HMAC, rejects stale payloads, maps the telegram id to an
+inemd member, and mints a signed session token that inemdash asks it to verify.
+
+```
+sudo -u postgres psql -c "CREATE DATABASE inem_test OWNER inem"   # tests
+# secrets live in /etc/inem-gate.env (root, 600): bot token + session secret
+```
+
+- Binds `127.0.0.1:8778` and is never proxied: a bug in the internet-facing
+  dashboard leaks data, not the bot token (which can read every bot update and
+  impersonate the bot).
+- Unknown telegram ids are refused (`403`) and a broken roster fails closed.
+- Sessions last `INEM_GATE_TTL_HOURS` (default 720h); `INEM_GATE_MAX_SKEW_SEC`
+  (default 300) bounds how old an `initData` may be.
 
 ## Deployment notes
 

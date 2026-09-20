@@ -1,11 +1,18 @@
 // inemdash — read-only dashboard for the inemd household data.
 //
 // Serves one static page plus a small JSON passthrough that talks to inemd on
-// 127.0.0.1. Only GET is routed: there is no write path through this binary at
-// all, so exposing it (nginx + TLS + basic auth) can never change the ledger.
+// 127.0.0.1. Only GET routes reach inemd: there is no write path through this
+// binary at all, so exposing it (nginx + TLS) can never change the ledger.
+//
+// Identity comes from inemgate: Telegram signs the Mini App's initData, and
+// only inemgate holds the bot token needed to check that signature. This binary
+// therefore keeps no secret — it asks the gate to verify a session token and
+// uses the returned inemd user id. The data endpoints then serve *that person's*
+// data, so the wife sees her pockets and Dani sees his.
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -14,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,43 +29,234 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+const sessionCookie = "inem_session"
+
 type server struct {
-	upstream string // inemd base URL, e.g. http://127.0.0.1:8777
-	userID   string // X-User-ID inemd expects
-	authUser string // optional basic-auth user (empty passwd = no auth)
-	passwd   string
+	upstream string // inemd base URL
+	gate     string // inemgate base URL
+	userID   string // inemd user for break-glass password login
+	authUser string // break-glass basic-auth user
+	passwd   string // empty = no break-glass login at all
 	client   *http.Client
+}
+
+type identity struct {
+	UserID int
+	Name   string
+	Via    string // "telegram" or "password"
 }
 
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.serveIndex)
-	mux.HandleFunc("GET /api/pockets", s.pass("/v1/pockets", nil))
-	mux.HandleFunc("GET /api/summary", s.pass("/v1/expense/summary", periodQuery))
-	mux.HandleFunc("GET /api/txns", s.pass("/v1/transactions", func(r *http.Request) (string, error) {
+	mux.HandleFunc("GET /auth/logout", s.authLogout)
+	mux.HandleFunc("POST /auth/telegram", s.authTelegram)
+	mux.HandleFunc("POST /auth/password", s.authPassword)
+	// whoami answers for everyone: the page uses it to decide between the app
+	// and the login screen.
+	mux.HandleFunc("GET /api/whoami", s.whoami)
+
+	mux.HandleFunc("GET /api/pockets", s.authed(s.pass("/v1/pockets", nil)))
+	mux.HandleFunc("GET /api/summary", s.authed(s.pass("/v1/expense/summary", periodQuery)))
+	mux.HandleFunc("GET /api/txns", s.authed(s.pass("/v1/transactions", func(r *http.Request) (string, error) {
 		q, err := periodQuery(r)
 		if err != nil {
 			return "", err
 		}
 		return q + "&limit=" + limitOr(r, "100", "500"), nil
-	}))
-	mux.HandleFunc("GET /api/pocket", s.proxyPocketDetail)
-	mux.HandleFunc("GET /api/notes", s.proxyNotes)
-	mux.HandleFunc("GET /api/notes/{id}", s.pass("/v1/notes/{id}", nil))
-	mux.HandleFunc("GET /api/meals", s.pass("/v1/meals", func(r *http.Request) (string, error) {
+	})))
+	mux.HandleFunc("GET /api/pocket", s.authed(s.pocketDetail))
+	mux.HandleFunc("GET /api/notes", s.authed(s.proxyNotes))
+	mux.HandleFunc("GET /api/notes/{id}", s.authed(s.pass("/v1/notes/{id}", nil)))
+	mux.HandleFunc("GET /api/meals", s.authed(s.pass("/v1/meals", func(r *http.Request) (string, error) {
 		return "?day=" + dayOr(r, time.Now().Format("2006-01-02")), nil
-	}))
-	mux.HandleFunc("GET /api/day", s.pass("/v1/nutrition/daily", func(r *http.Request) (string, error) {
+	})))
+	mux.HandleFunc("GET /api/day", s.authed(s.pass("/v1/nutrition/daily", func(r *http.Request) (string, error) {
 		return "?day=" + dayOr(r, time.Now().Format("2006-01-02")), nil
-	}))
-	mux.HandleFunc("GET /api/target", s.pass("/v1/nutrition/target", func(r *http.Request) (string, error) {
+	})))
+	mux.HandleFunc("GET /api/target", s.authed(s.pass("/v1/nutrition/target", func(r *http.Request) (string, error) {
 		return "?day=" + dayOr(r, time.Now().Format("2006-01-02")), nil
-	}))
-	return s.withAuth(mux)
+	})))
+	return mux
 }
 
+// ---------- identity ----------
+
+// resolve reads the session cookie (verified by the gate) or the break-glass
+// password. Everything else is anonymous.
+func (s *server) resolve(r *http.Request) (identity, bool) {
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		if id, err := s.verifySession(r, c.Value); err == nil {
+			return id, true
+		}
+	}
+	if s.passwd != "" {
+		user, pass, ok := r.BasicAuth()
+		if ok && user == s.authUser && pass == s.passwd {
+			uid, err := strconv.Atoi(s.userID)
+			if err != nil || uid <= 0 {
+				return identity{}, false
+			}
+			return identity{UserID: uid, Name: s.authUser, Via: "password"}, true
+		}
+	}
+	return identity{}, false
+}
+
+// verifySession asks inemgate whether a session token is genuine and fresh.
+func (s *server) verifySession(r *http.Request, token string) (identity, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		s.gate+"/v1/verify?token="+urlQueryEscape(token), nil)
+	if err != nil {
+		return identity{}, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return identity{}, fmt.Errorf("gate unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		return identity{}, fmt.Errorf("gate rejected the session: %s", strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		UserID      int    `json:"user_id"`
+		DisplayName string `json:"display_name"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.UserID == 0 {
+		return identity{}, fmt.Errorf("gate returned an unusable session")
+	}
+	return identity{UserID: out.UserID, Name: out.DisplayName, Via: "telegram"}, nil
+}
+
+// authed guards every data endpoint: no identity, no data.
+func (s *server) authed(next func(w http.ResponseWriter, r *http.Request, id identity)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := s.resolve(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+			return
+		}
+		next(w, r, id)
+	}
+}
+
+func (s *server) whoami(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.resolve(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authenticated":  ok,
+		"user_id":        id.UserID,
+		"display_name":   id.Name,
+		"via":            id.Via,
+		"password_login": s.passwd != "",
+	})
+}
+
+// authTelegram takes the Mini App initData, has the gate check Telegram's
+// signature, and turns a good one into a session cookie.
+func (s *server) authTelegram(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		InitData string `json:"init_data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json"})
+		return
+	}
+	if strings.TrimSpace(in.InitData) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "init_data required"})
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"init_data": in.InitData})
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.gate+"/v1/session", bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "gate unreachable"})
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(raw) // the gate's reason ("not a registered member", ...)
+		return
+	}
+	var out struct {
+		Token       string `json:"token"`
+		UserID      int    `json:"user_id"`
+		DisplayName string `json:"display_name"`
+		ExpiresAt   int64  `json:"expires_at"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.Token == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "gate returned no session"})
+		return
+	}
+	s.setSessionCookie(w, r, out.Token, out.ExpiresAt)
+	writeJSON(w, http.StatusOK, map[string]any{"user_id": out.UserID, "display_name": out.DisplayName})
+}
+
+// authPassword is the break-glass path: only active when a password is set.
+func (s *server) authPassword(w http.ResponseWriter, r *http.Request) {
+	if s.passwd == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "password login is disabled"})
+		return
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		var in struct {
+			User     string `json:"user"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in); err == nil {
+			user, pass, ok = in.User, in.Password, true
+		}
+	}
+	if !ok || user != s.authUser || pass != s.passwd {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong user or password"})
+		return
+	}
+	s.setSessionCookie(w, r, "", 0) // no gate token: basic auth is re-checked per request
+	writeJSON(w, http.StatusOK, map[string]any{"user_id": s.userID, "display_name": s.authUser})
+}
+
+func (s *server) authLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: "", Path: cookiePath(r),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expiresAt int64) {
+	c := &http.Cookie{
+		Name: sessionCookie, Value: token, Path: cookiePath(r),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+	}
+	if expiresAt > 0 {
+		c.MaxAge = int(time.Until(time.Unix(expiresAt, 0)).Seconds())
+	}
+	http.SetCookie(w, c)
+}
+
+// cookiePath keeps the cookie scoped to where the app is mounted (/inem/ when
+// nginx proxies it, / when the dashboard is served at the root).
+func cookiePath(r *http.Request) string {
+	p := r.URL.Path
+	if strings.HasPrefix(p, "/inem/") || p == "/inem" {
+		return "/inem/"
+	}
+	return "/"
+}
+
+// ---------- pages and passthrough ----------
+
 func (s *server) serveIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path != "/" && r.URL.Path != "/inem" {
 		http.NotFound(w, r)
 		return
 	}
@@ -65,34 +264,19 @@ func (s *server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(indexHTML)
 }
 
-// withAuth adds HTTP basic auth when a password is configured. The dashboard
-// shows household money, so a deployment that is reachable off-box must set one.
-func (s *server) withAuth(next http.Handler) http.Handler {
-	if s.passwd == "" {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != s.authUser || pass != s.passwd {
-			w.Header().Set("WWW-Authenticate", `Basic realm="mpok inem"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+type queryFunc func(*http.Request) (string, error)
 
-// pass forwards a GET to inemd, rewriting the query with q (when given).
-// path may contain {id}, taken from the incoming path.
-func (s *server) pass(path string, q func(*http.Request) (string, error)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// pass forwards a GET to inemd as the authenticated user. path may contain
+// {id}, taken from the incoming path.
+func (s *server) pass(path string, q queryFunc) func(http.ResponseWriter, *http.Request, identity) {
+	return func(w http.ResponseWriter, r *http.Request, id identity) {
 		target := path
-		if id := r.PathValue("id"); id != "" {
-			if _, err := fmt.Sscanf(id, "%d", new(int)); err != nil {
-				badGateway(w, "bad id")
+		if pid := r.PathValue("id"); pid != "" {
+			if _, err := strconv.Atoi(pid); err != nil {
+				http.Error(w, "bad id", http.StatusBadRequest)
 				return
 			}
-			target = strings.ReplaceAll(target, "{id}", id)
+			target = strings.ReplaceAll(target, "{id}", pid)
 		}
 		if q != nil {
 			query, err := q(r)
@@ -102,16 +286,73 @@ func (s *server) pass(path string, q func(*http.Request) (string, error)) http.H
 			}
 			target += query
 		}
-		s.forward(w, r, target)
+		s.forward(w, r, target, id.UserID)
 	}
 }
 
-// proxyPocketDetail serves one pocket's ledger: the pocket itself, its own
-// entries, and the transfers in or out of it — merged into one response so the
-// page does not have to stitch three calls together.
-func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.URL.Query().Get("id"))
-	if _, err := fmt.Sscanf(id, "%d", new(int)); id == "" || err != nil {
+// proxyNotes: list, tag-filter, or full-text search — one endpoint for the page.
+func (s *server) proxyNotes(w http.ResponseWriter, r *http.Request, id identity) {
+	q := r.URL.Query()
+	if term := strings.TrimSpace(q.Get("q")); term != "" {
+		s.forward(w, r, "/v1/notes/search?q="+urlQueryEscape(term), id.UserID)
+		return
+	}
+	if tag := strings.TrimSpace(q.Get("tag")); tag != "" {
+		s.forward(w, r, "/v1/notes?limit=100&tag="+urlQueryEscape(tag), id.UserID)
+		return
+	}
+	s.forward(w, r, "/v1/notes?limit=100", id.UserID)
+}
+
+func (s *server) forward(w http.ResponseWriter, r *http.Request, target string, uid int) {
+	body, code, err := s.get(r, target, uid)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write(body)
+}
+
+// get performs the upstream GET and returns the body plus inemd's status code
+// (an error response is still JSON and still belongs to the caller).
+func (s *server) get(r *http.Request, target string, uid int) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.upstream+target, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("X-User-ID", strconv.Itoa(uid))
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("inemd unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+// fetch is a GET that treats a non-2xx as an error (used by the composed view).
+func (s *server) fetch(r *http.Request, target string, uid int) ([]byte, error) {
+	body, code, err := s.get(r, target, uid)
+	if err != nil {
+		return nil, err
+	}
+	if code < 200 || code > 299 {
+		return nil, fmt.Errorf("inemd %s: %s", target, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+// pocketDetail serves one pocket's ledger: the pocket itself, its own entries,
+// and the transfers in or out of it — merged into one response so the page does
+// not have to stitch three calls together.
+func (s *server) pocketDetail(w http.ResponseWriter, r *http.Request, id identity) {
+	pid := strings.TrimSpace(r.URL.Query().Get("id"))
+	if _, err := strconv.Atoi(pid); pid == "" || err != nil {
 		http.Error(w, "id must be a positive integer", http.StatusBadRequest)
 		return
 	}
@@ -120,20 +361,19 @@ func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	pocket, err := s.fetch("/v1/pockets/" + id)
+	pocket, err := s.fetch(r, "/v1/pockets/"+pid, id.UserID)
 	if err != nil {
-		badGateway(w, err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-	txns, err := s.fetch("/v1/transactions" + period + "&pocket_id=" + id + "&limit=500")
+	txns, err := s.fetch(r, "/v1/transactions"+period+"&pocket_id="+pid+"&limit=500", id.UserID)
 	if err != nil {
-		badGateway(w, err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-	transfers, err := s.fetch("/v1/transfers" + period + "&pocket_id=" + id + "&limit=500")
+	transfers, err := s.fetch(r, "/v1/transfers"+period+"&pocket_id="+pid+"&limit=500", id.UserID)
 	if err != nil {
-		badGateway(w, err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -159,7 +399,7 @@ func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
 		CreatedAt string `json:"created_at"`
 	}
 	if err := json.Unmarshal(txns, &txnRows); err != nil {
-		badGateway(w, "bad transactions payload: "+err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "bad transactions payload"})
 		return
 	}
 	for _, t := range txnRows {
@@ -188,13 +428,13 @@ func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
 		CreatedAt  string `json:"created_at"`
 	}
 	if err := json.Unmarshal(transfers, &transferRows); err != nil {
-		badGateway(w, "bad transfers payload: "+err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "bad transfers payload"})
 		return
 	}
 	for _, t := range transferRows {
 		dir, counter, label := "in", t.From, "← "+t.From
 		moveIn += t.AmountIDR
-		if fmt.Sprint(t.FromPocket) == id {
+		if fmt.Sprint(t.FromPocket) == pid {
 			dir, counter, label = "out", t.To, "→ "+t.To
 			moveIn -= t.AmountIDR
 			moveOut += t.AmountIDR
@@ -210,84 +450,21 @@ func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
 
 	sort.SliceStable(movements, func(i, j int) bool { return movements[i].At > movements[j].At })
 
-	resp := map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"pocket":    json.RawMessage(pocket),
 		"totals":    map[string]any{"out_idr": out, "in_idr": in, "transfer_out_idr": moveOut, "transfer_in_idr": moveIn},
 		"movements": movements,
 		"period":    period,
-	}
+		"user_id":   id.UserID,
+	})
+}
+
+// ---------- helpers ----------
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// fetch is a GET against inemd that returns the body or an error for a non-2xx.
-func (s *server) fetch(target string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, s.upstream+target, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-User-ID", s.userID)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("inemd %s: %s", target, strings.TrimSpace(string(body)))
-	}
-	return body, nil
-}
-
-// proxyNotes: list, tag-filter, or full-text search — one endpoint for the page.
-func (s *server) proxyNotes(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	if term := strings.TrimSpace(q.Get("q")); term != "" {
-		s.forward(w, r, "/v1/notes/search?q="+urlQueryEscape(term))
-		return
-	}
-	if tag := strings.TrimSpace(q.Get("tag")); tag != "" {
-		s.forward(w, r, "/v1/notes?limit=100&tag="+urlQueryEscape(tag))
-		return
-	}
-	s.forward(w, r, "/v1/notes?limit=100")
-}
-
-func (s *server) forward(w http.ResponseWriter, r *http.Request, target string) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.upstream+target, nil)
-	if err != nil {
-		badGateway(w, err.Error())
-		return
-	}
-	req.Header.Set("X-User-ID", s.userID)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		badGateway(w, "inemd unreachable: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		badGateway(w, err.Error())
-		return
-	}
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "application/json"
-	}
-	// passthrough of a JSON error is still JSON: keep the upstream status
-	w.Header().Set("Content-Type", ct)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
-}
-
-func badGateway(w http.ResponseWriter, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadGateway)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func urlQueryEscape(s string) string {
@@ -392,16 +569,17 @@ func env(key, def string) string {
 func main() {
 	s := &server{
 		upstream: env("INEM_BASE", "http://127.0.0.1:8777"),
+		gate:     env("INEM_GATE_BASE", "http://127.0.0.1:8778"),
 		userID:   env("INEM_WEB_USER", "1"),
-		authUser: env("INEM_WEB_AUTH_USER", "inem"),
+		authUser: env("INEM_WEB_AUTH_USER", "dani"),
 		passwd:   os.Getenv("INEM_WEB_AUTH_PASS"),
 		client:   &http.Client{Timeout: 15 * time.Second},
 	}
 	addr := env("INEM_WEB_ADDR", "127.0.0.1:8090")
 	if s.passwd == "" {
-		log.Printf("warning: INEM_WEB_AUTH_PASS is unset — no authentication")
+		log.Printf("break-glass password login disabled (INEM_WEB_AUTH_PASS unset)")
 	}
-	log.Printf("inemdash listening on %s (inemd %s, user %s)", addr, s.upstream, s.userID)
+	log.Printf("inemdash listening on %s (inemd %s, gate %s)", addr, s.upstream, s.gate)
 	srv := &http.Server{Addr: addr, Handler: s.handler(), ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }

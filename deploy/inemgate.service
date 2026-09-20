@@ -1,0 +1,29 @@
+[Unit]
+Description=Mpok Inem Telegram Mini App gate (inemgate)
+Documentation=https://github.com/gaisuke/mpok-inem
+After=network-online.target inemd.service
+Wants=inemd.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/inem-gate.env
+ExecStart=/usr/local/bin/inemgate
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# the bot token lives in this unit's env file: this process needs no files at
+# all, so it must not be able to read /home (where Hermes keeps its own copy)
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

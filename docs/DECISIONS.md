@@ -88,3 +88,28 @@ Two calls made after the CRUD/admin surface landed:
   exercised, so a new endpoint cannot ship untested. Writing the suite found two
   real bugs: a tags-less note POST violated NOT NULL, and `scope=all` reset
   rewound id sequences while another member still had rows (colliding ids).
+
+## D5 — Identity is Telegram's, and the bot token stays out of the public process (2026-09-20)
+
+Login is a Telegram Mini App instead of a shared password. A telegram id on its
+own proves nothing (anyone can type it), so the dashboard trusts only the HMAC
+Telegram puts in `initData`, checked against the bot token.
+
+That check needs the token, and the token can read every bot update and
+impersonate the bot — so it lives in **inemgate**, which binds 127.0.0.1 and is
+never proxied. The internet-facing dashboard holds no secret: it asks the gate to
+verify a session token, then serves that member's data. A bug in the public
+process therefore leaks household data, not the bot. Both public-facing units run
+with `ProtectHome=yes` so they cannot read Hermes' own `.env` either.
+
+Consequences worth keeping:
+
+- Identity decides data: the verified telegram id becomes the `X-User-ID` sent to
+  inemd, so the wife sees her pockets and Dani sees his. Unknown telegram ids are
+  refused until they exist in the roster (one `/start` + one roster row).
+- `auth_date` freshness (default 5 min) is what stops a leaked `initData` being
+  replayed; sessions are separate signed tokens with a 30-day life.
+- The page needs no external SDK: Telegram passes the payload in the URL hash, so
+  the dashboard still works when telegram.org is unreachable.
+- Per-pocket sharing (`shared` vs `private`) is still to come; when it lands it
+  must be read-only for non-owners and default to private.
