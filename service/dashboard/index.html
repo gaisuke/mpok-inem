@@ -161,6 +161,8 @@
       <button class="act" id="txn-refresh">Muat ulang</button>
     </div>
     <ul id="txns"></ul>
+    <h2>Pindah uang</h2>
+    <ul id="transfers"></ul>
   </section>
 
   <section id="notes">
@@ -302,6 +304,23 @@ async function loadTxns() {
   } catch (e) { fail(ul, e.message); }
 }
 
+// Transfers are not spending — they only move money — but an incoming transfer
+// from another member must be visible, or a pocket balance would appear to jump
+// on its own.
+async function loadTransfers() {
+  const ul = $('transfers');
+  try {
+    const rows = await api('/api/transfers?period=' + encodeURIComponent($('txn-period').value) + '&limit=200');
+    if (!rows.length) return empty(ul, 'tidak ada pindah uang');
+    ul.innerHTML = rows.map(t => `
+      <li><div class="top">
+        <span class="name">${esc(t.from_user)}:${esc(t.from)} → ${esc(t.to_user)}:${esc(t.to)}</span>
+        <span class="amt">${num(t.amount_idr)}</span>
+      </div><div class="meta">${esc(t.created_at.slice(0, 16).replace('T', ' '))}
+        · <span class="pill">transfer</span>${t.note ? ' · ' + esc(t.note) : ''}</div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
 async function loadNotes() {
   const ul = $('notes-list');
   const q = $('note-q').value.trim(), tag = $('note-tag').value.trim();
@@ -351,7 +370,7 @@ function showTab(name) {
   if (name === 'ringkasan') { loadSummary(); loadPockets(); }
   if (name === 'pocket' && currentPocket) openPocket(currentPocket, $('pd-period').value);
   if (name === 'rumah') loadHousehold();
-  if (name === 'transaksi') loadTxns();
+  if (name === 'transaksi') { loadTxns(); loadTransfers(); }
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
 }
@@ -375,7 +394,7 @@ $('hh-members').addEventListener('click', (e) => {
 $('pocket-back').addEventListener('click', () => showTab('ringkasan'));
 $('pd-period').addEventListener('change', () => openPocket(currentPocket, $('pd-period').value));
 $('refresh').addEventListener('click', () => { loadSummary(); loadPockets(); });
-$('txn-refresh').addEventListener('click', loadTxns);
+$('txn-refresh').addEventListener('click', () => { loadTxns(); loadTransfers(); });
 $('note-refresh').addEventListener('click', loadNotes);
 $('note-q').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });
 $('note-tag').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });

@@ -79,8 +79,8 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | POST | `/v1/transactions` | record a transaction |
 | GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `pocket_id`, `limit`) |
 | GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, or drop a mistaken entry |
-| POST | `/v1/transfers` | move money between pockets |
-| GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `pocket_id`, `limit`) |
+| POST | `/v1/transfers` | move money between pockets (`from_pocket_id`, `to_pocket_id`, `amount_idr`, `note`); destination may be another member's shared pocket |
+| GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `pocket_id`, `limit`) — includes moves into/out of your pockets made by the other member |
 | DELETE | `/v1/transfers/{id}` | drop a mistaken transfer |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
 | POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |

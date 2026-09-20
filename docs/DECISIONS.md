@@ -133,6 +133,33 @@ explicitly. The rules that keep this from leaking:
 - `GET /v1/transactions?pocket_id=` scopes by pocket *after* the access check
   rather than by `user_id`, because a shared pocket's rows belong to its owner.
 
+## D8 — Money moves between members, not just between pockets (2026-09-20)
+
+- **The three cases are one operation.** Cash withdrawal (BRImo → Cash), moving
+  money between his own pockets, and giving money to his wife are all a transfer:
+  no `spend` entry, because a transfer is not an expense and recording it as one
+  would double-count it. `POST /v1/transfers` takes any two pockets the caller can
+  reach, so there is one code path to reason about and one place to get the
+  balance maths right.
+- **The giver spends their own money, and only their own.** `from_pocket` must
+  belong to the caller; `to_pocket` may belong to another member *if the caller
+  can see it* (shared). Giving money away needs nobody's permission — taking it
+  does, so a member can never move money out of someone else's pocket.
+- **A destination the caller cannot see answers like one that does not exist**
+  (same status, same message), so private pocket names cannot be probed by trying
+  to send money into them.
+- **The receiver must see it.** `GET /v1/transfers` now lists every transfer that
+  touches one of the caller's pockets, whoever created the row, and each row
+  carries `from_user`/`to_user`. A balance that grew because money arrived from
+  another member has an explanation in the same view (the dashboard's Transaksi
+  tab lists transfers under "Pindah uang"). Transparent money, still-private
+  pocket names: a counterparty pocket the reader cannot see stays `(pribadi)`.
+- **Only the giver can undo it** (`DELETE` is scoped to the row's creator), and
+  undoing moves both balances back — verified end to end, including a real
+  transfer between his account and hers created and then reversed.
+- **An internal transfer changes no household total** — asserted in the tests, so
+  a bug that double-books a move would be caught.
+
 ## D7 — Member scope decides which features a member gets (2026-09-20)
 
 - **Scope lives on the member, not in the browser.** `inem_auth.users.scope`

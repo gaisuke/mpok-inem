@@ -255,6 +255,13 @@ func (a *apiTest) balance(id int) int64 {
 	return 0
 }
 
+// balanceOf reads a pocket's balance through the single-pocket endpoint, which
+// also serves a pocket another member has shared.
+func (a *apiTest) balanceOf(uid, id int) int64 {
+	a.t.Helper()
+	return int64(a.reqJSON("GET", fmt.Sprintf("/v1/pockets/%d", id), uid)["balance_idr"].(float64))
+}
+
 func (a *apiTest) spend(pocketID int, direction string, amount int64, category, note string) int {
 	a.t.Helper()
 	out := a.obj("POST", "/v1/transactions", map[string]any{
@@ -524,6 +531,102 @@ func TestTransferLifecycle(t *testing.T) {
 	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d", id), nil, 400)
 	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", id), nil, 200)
 	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", id), nil, 404)
+}
+
+// Money moves between members too: the giver may only spend from their own
+// pocket, and the receiver must see the movement instead of a balance that
+// jumped by itself. Private pocket names stay private even in the movement list.
+func TestTransferBetweenMembers(t *testing.T) {
+	a := newAPI(t)
+	pipit := mkUser(t, a.conn, 2, "Pipit")
+
+	mine := a.pocket("BRImo", "cash", 620960)
+	a.obj("PATCH", fmt.Sprintf("/v1/pockets/%d", mine), map[string]any{"visibility": "shared"}, 200)
+	secret := a.pocket("Dana Darurat", "savings", 0) // mine, stays private
+
+	hers := int(a.reqJSONObj("POST", "/v1/pockets", pipit, map[string]any{
+		"name": "seabank", "type": "cash", "opening_balance_idr": 983678, "visibility": "shared"}, 201)["id"].(float64))
+	herPrivate := int(a.reqJSONObj("POST", "/v1/pockets", pipit, map[string]any{
+		"name": "brimo", "type": "cash", "opening_balance_idr": 759531}, 201)["id"].(float64))
+
+	// she may not spend my money, nor push money into a pocket she cannot see —
+	// and an invisible pocket answers exactly like one that does not exist
+	a.reqJSONObj("POST", "/v1/transfers", pipit, map[string]any{
+		"from_pocket_id": mine, "to_pocket_id": hers, "amount_idr": 1000}, 400)
+	a.reqJSONObj("POST", "/v1/transfers", pipit, map[string]any{
+		"from_pocket_id": hers, "to_pocket_id": secret, "amount_idr": 1000}, 400)
+	_, hiddenMsg := a.req("POST", "/v1/transfers", map[string]any{
+		"from_pocket_id": hers, "to_pocket_id": secret, "amount_idr": 1000}, pipit, true)
+	_, missingMsg := a.req("POST", "/v1/transfers", map[string]any{
+		"from_pocket_id": hers, "to_pocket_id": 999999, "amount_idr": 1000}, pipit, true)
+	if string(hiddenMsg) != string(missingMsg) {
+		t.Fatalf("a hidden pocket must be indistinguishable from a missing one: %s vs %s", hiddenMsg, missingMsg)
+	}
+
+	totalBefore := int64(a.obj("GET", "/v1/household", nil, 200)["total_balance_idr"].(float64))
+
+	// the gift: her shared pocket into my shared pocket
+	gift := a.reqJSONObj("POST", "/v1/transfers", pipit, map[string]any{
+		"from_pocket_id": hers, "to_pocket_id": mine, "amount_idr": 200000, "note": "uang belanja"}, 201)
+	giftID := int(gift["id"].(float64))
+
+	if got := a.balanceOf(a.uid, hers); got != 783678 {
+		t.Fatalf("her pocket after giving: %d", got)
+	}
+	if got := a.balanceOf(a.uid, mine); got != 820960 {
+		t.Fatalf("my pocket after receiving: %d", got)
+	}
+	// moving money inside the household changes no household total
+	if got := int64(a.obj("GET", "/v1/household", nil, 200)["total_balance_idr"].(float64)); got != totalBefore {
+		t.Fatalf("household total moved on an internal transfer: %d → %d", totalBefore, got)
+	}
+
+	// I see it in my own list, with who sent it
+	rows := a.list("GET", "/v1/transfers", 200)
+	if len(rows) != 1 {
+		t.Fatalf("the receiver should see the incoming transfer: %v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if row["from"] != "seabank" || row["from_user"] != "Pipit" || row["to"] != "BRImo" ||
+		row["to_user"] != "Test Dani" || row["note"] != "uang belanja" {
+		t.Fatalf("incoming transfer row: %v", row)
+	}
+	if got := len(a.reqList("GET", "/v1/transfers", pipit)); got != 1 {
+		t.Fatalf("the giver should see it too: %d", got)
+	}
+	// and it shows up in the receiving pocket's own movements
+	if got := len(a.reqList("GET", fmt.Sprintf("/v1/transfers?pocket_id=%d", mine), pipit)); got != 1 {
+		t.Fatalf("her view of my pocket movements: %d", got)
+	}
+
+	// from a private pocket the movement is visible but the pocket name is not
+	anon := a.reqJSONObj("POST", "/v1/transfers", pipit, map[string]any{
+		"from_pocket_id": herPrivate, "to_pocket_id": mine, "amount_idr": 5000, "note": "top up"}, 201)
+	anonID := int(anon["id"].(float64))
+	var anonRow map[string]any
+	for _, r := range a.list("GET", "/v1/transfers", 200) {
+		if int(r.(map[string]any)["id"].(float64)) == anonID {
+			anonRow = r.(map[string]any)
+		}
+	}
+	if anonRow == nil || anonRow["from"] != "(pribadi)" || anonRow["from_user"] != "Pipit" ||
+		int64(anonRow["amount_idr"].(float64)) != 5000 {
+		t.Fatalf("a private source must be masked, not hidden: %v", anonRow)
+	}
+
+	// only the giver can undo her own transfer, and undoing it moves both balances back
+	if code, _ := a.req("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", giftID), nil, a.uid, true); code != 404 {
+		t.Fatalf("the receiver must not delete the giver's transfer: %d", code)
+	}
+	if code, _ := a.req("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", giftID), nil, pipit, true); code != 200 {
+		t.Fatalf("the giver should be able to undo it: %d", code)
+	}
+	if got := a.balanceOf(a.uid, mine); got != 625960 {
+		t.Fatalf("my pocket after the undo: %d", got)
+	}
+	if got := a.balanceOf(a.uid, hers); got != 983678 {
+		t.Fatalf("her pocket after the undo: %d", got)
+	}
 }
 
 func TestSummaryRollsUpPeriods(t *testing.T) {

@@ -241,6 +241,11 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 	writeJSON(w, 201, map[string]any{"id": id})
 }
 
+// createTransfer moves money between pockets. The source must be the caller's
+// own pocket — nobody spends someone else's money — while the destination may be
+// another member's pocket, as long as the caller can see it (shared): that is the
+// "I gave my wife some money" case. A private pocket the caller cannot see is
+// reported exactly like a pocket that does not exist, so names cannot be probed.
 func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 	var in struct {
 		From   int    `json:"from_pocket_id"`
@@ -256,10 +261,19 @@ func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, "from/to/amount invalid")
 		return
 	}
-	var bal int64
-	err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, in.From, userID).Scan(&bal)
+	var owned int
+	err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, in.From, userID).Scan(&owned)
 	if err != nil {
 		badReq(w, "source pocket not found for user")
+		return
+	}
+	visible, err := pocketVisibleTo(userID, in.To)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if !visible {
+		badReq(w, "destination pocket not found")
 		return
 	}
 	var id int
@@ -1006,8 +1020,10 @@ type transfer struct {
 	ID         int64  `json:"id"`
 	FromPocket int    `json:"from_pocket_id"`
 	From       string `json:"from"`
+	FromUser   string `json:"from_user"`
 	ToPocket   int    `json:"to_pocket_id"`
 	To         string `json:"to"`
+	ToUser     string `json:"to_user"`
 	AmountIDR  int64  `json:"amount_idr"`
 	Note       string `json:"note"`
 	CreatedAt  string `json:"created_at"`
@@ -1030,7 +1046,10 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 		return
 	}
 	args := []any{userID} // $1 is the caller: it also drives the masking below
-	where := "tr.user_id=$1"
+	// Money that moved in or out of the caller's pockets shows up even when the
+	// row was created by the other member — an incoming gift must not appear as
+	// an unexplained jump in a balance.
+	where := "(tr.user_id=$1 OR pf.user_id=$1 OR pt.user_id=$1)"
 	if p := r.URL.Query().Get("pocket_id"); p != "" {
 		pid, err := strconv.Atoi(p)
 		if err != nil || pid <= 0 {
@@ -1063,12 +1082,16 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 	args = append(args, limit)
 	rows, err := db.Query(fmt.Sprintf(`SELECT tr.id, tr.from_pocket,
 		CASE WHEN pf.user_id=$1 OR pf.visibility='shared' THEN pf.name ELSE '(pribadi)' END,
+		fu.display_name,
 		tr.to_pocket,
 		CASE WHEN pt.user_id=$1 OR pt.visibility='shared' THEN pt.name ELSE '(pribadi)' END,
+		tu.display_name,
 		tr.amount, COALESCE(tr.note,''), tr.created_at
 		FROM expense.transfers tr
 		JOIN expense.pockets pf ON pf.id=tr.from_pocket
 		JOIN expense.pockets pt ON pt.id=tr.to_pocket
+		JOIN inem_auth.users fu ON fu.id=pf.user_id
+		JOIN inem_auth.users tu ON tu.id=pt.user_id
 		WHERE %s ORDER BY tr.id DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
 		badReq(w, err.Error())
@@ -1079,7 +1102,8 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 	for rows.Next() {
 		var t transfer
 		var ts time.Time
-		if err := rows.Scan(&t.ID, &t.FromPocket, &t.From, &t.ToPocket, &t.To, &t.AmountIDR, &t.Note, &ts); err != nil {
+		if err := rows.Scan(&t.ID, &t.FromPocket, &t.From, &t.FromUser, &t.ToPocket, &t.To, &t.ToUser,
+			&t.AmountIDR, &t.Note, &ts); err != nil {
 			badReq(w, err.Error())
 			return
 		}
