@@ -19,6 +19,11 @@
   #who a { color: var(--accent); text-decoration: none; margin-left: 8px; }
   #login { position: fixed; inset: 0; background: rgba(15,17,21,.97); display: flex;
     align-items: center; justify-content: center; padding: 20px; z-index: 10; }
+  /* an author `display` beats the UA rule for [hidden], so the attribute alone
+     would never hide this overlay — the login screen stayed on top of a page
+     that was in fact authenticated */
+  #login[hidden] { display: none; }
+  #login-form[hidden] { display: none; }
   .loginbox { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
     padding: 22px; max-width: 380px; width: 100%; }
   .loginbox h2 { margin-top: 0; }
