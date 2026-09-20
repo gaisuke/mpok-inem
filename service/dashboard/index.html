@@ -45,6 +45,10 @@
   li .amt.out { color: var(--out); } li .amt.in { color: var(--in); }
   li .meta { color: var(--dim); font-size: 12.5px; margin-top: 3px; }
   li .body { margin-top: 8px; color: #cfd6e4; font-size: 13.5px; white-space: pre-wrap; }
+  li.tappable { cursor: pointer; }
+  li.tappable:hover { border-color: var(--accent); }
+  li.tappable .name::after { content: "›"; color: var(--dim); margin-left: 8px; }
+  .back { background: none; border: none; color: var(--accent); font-size: 14px; padding: 0 0 10px; cursor: pointer; }
   .pill { display: inline-block; background: #202634; color: var(--dim); border-radius: 999px;
     padding: 2px 8px; font-size: 11.5px; margin-right: 6px; }
   .empty, .err { color: var(--dim); font-size: 13.5px; text-align: center;
@@ -84,8 +88,28 @@
     </div>
     <h2>Pengeluaran per kategori</h2>
     <ul id="cats"></ul>
-    <h2>Saldo dompet</h2>
+    <h2>Saldo dompet <span class="meta">— ketuk untuk lihat mutasi</span></h2>
     <ul id="pockets"></ul>
+  </section>
+
+  <section id="pocket">
+    <button class="back" id="pocket-back">← Kembali</button>
+    <div class="cards">
+      <div class="card"><div class="k" id="pd-name">Dompet</div><div class="v" id="pd-balance">—</div><div class="sub" id="pd-type"></div></div>
+      <div class="card"><div class="k">Keluar</div><div class="v out" id="pd-out">—</div><div class="sub" id="pd-out-sub">periode terpilih</div></div>
+      <div class="card"><div class="k">Masuk</div><div class="v in" id="pd-in">—</div><div class="sub" id="pd-in-sub">periode terpilih</div></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <select id="pd-period">
+        <option value="today">Hari ini</option>
+        <option value="week">Minggu ini</option>
+        <option value="last-week">Minggu lalu</option>
+        <option value="month" selected>Bulan ini</option>
+        <option value="last-month">Bulan lalu</option>
+      </select>
+    </div>
+    <h2>Mutasi</h2>
+    <ul id="pd-movements"></ul>
   </section>
 
   <section id="transaksi">
@@ -144,6 +168,7 @@ const empty = (el, msg) => { el.innerHTML = '<li class="empty">' + esc(msg) + '<
 
 let pocketsById = {};
 let allPockets = [];
+let currentPocket = null;
 
 async function loadPockets() {
   allPockets = await api('/api/pockets');
@@ -154,10 +179,36 @@ async function loadPockets() {
   const ul = $('pockets');
   if (!allPockets.length) return empty(ul, 'belum ada dompet');
   ul.innerHTML = allPockets.map(p => `
-    <li><div class="top">
+    <li class="tappable" data-pocket="${p.id}"><div class="top">
       <span class="name">${esc(p.name)}</span>
       <span class="amt ${p.balance_idr < 0 ? 'out' : ''}">${num(p.balance_idr)}</span>
-    </div><div class="meta"><span class="pill">${esc(p.type)}</span><span class="pill">#${p.id}</span></div></li>`).join('');
+    </div><div class="meta"><span class="pill">${esc(p.type)}</span></div></li>`).join('');
+}
+
+async function openPocket(id, period) {
+  const ul = $('pd-movements');
+  const p = period || $('pd-period').value;
+  currentPocket = id;
+  try {
+    const d = await api('/api/pocket?id=' + encodeURIComponent(id) + '&period=' + encodeURIComponent(p));
+    const pk = d.pocket || {};
+    $('pd-name').textContent = pk.name || 'Dompet';
+    $('pd-balance').textContent = num(pk.balance_idr);
+    $('pd-type').textContent = pk.type || '';
+    const t = d.totals || {};
+    $('pd-out').textContent = num(t.out_idr);
+    $('pd-in').textContent = num(t.in_idr);
+    $('pd-out-sub').textContent = t.transfer_out_idr ? 'pindah keluar ' + num(t.transfer_out_idr) : 'periode terpilih';
+    $('pd-in-sub').textContent = t.transfer_in_idr ? 'pindah masuk ' + num(t.transfer_in_idr) : 'periode terpilih';
+    const rows = d.movements || [];
+    if (!rows.length) return empty(ul, 'belum ada mutasi di periode ini');
+    ul.innerHTML = rows.map(m => `
+      <li><div class="top">
+        <span class="name">${esc(m.label)}</span>
+        <span class="amt ${m.direction}">${m.direction === 'out' ? '-' : '+'}${num(m.amount_idr)}</span>
+      </div><div class="meta">${esc((m.at || '').slice(0, 16).replace('T', ' '))}
+        <span class="pill">${m.kind === 'transfer' ? 'transfer' : esc(m.category || '')}</span></div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
 }
 
 async function loadSummary() {
@@ -235,12 +286,26 @@ function showTab(name) {
   document.querySelectorAll('.tabs button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === name));
   document.querySelectorAll('main section').forEach(s => s.classList.toggle('active', s.id === name));
   if (name === 'ringkasan') { loadSummary(); loadPockets(); }
+  if (name === 'pocket' && currentPocket) openPocket(currentPocket, $('pd-period').value);
   if (name === 'transaksi') loadTxns();
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
 }
 
+function showPocket(id) {
+  currentPocket = id;
+  $('pd-period').value = 'month';
+  document.querySelectorAll('main section').forEach(s => s.classList.toggle('active', s.id === 'pocket'));
+  openPocket(id, 'month');
+}
+
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
+$('pockets').addEventListener('click', (e) => {
+  const li = e.target.closest('li[data-pocket]');
+  if (li) showPocket(li.dataset.pocket);
+});
+$('pocket-back').addEventListener('click', () => showTab('ringkasan'));
+$('pd-period').addEventListener('change', () => openPocket(currentPocket, $('pd-period').value));
 $('refresh').addEventListener('click', () => { loadSummary(); loadPockets(); });
 $('txn-refresh').addEventListener('click', loadTxns);
 $('note-refresh').addEventListener('click', loadNotes);

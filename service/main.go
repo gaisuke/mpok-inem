@@ -369,6 +369,15 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 		args = append(args, d)
 		where += fmt.Sprintf(" AND t.direction=$%d", len(args))
 	}
+	if p := q.Get("pocket_id"); p != "" {
+		pid, err := strconv.Atoi(p)
+		if err != nil || pid <= 0 {
+			badReq(w, "pocket_id must be a positive integer")
+			return
+		}
+		args = append(args, pid)
+		where += fmt.Sprintf(" AND t.pocket_id=$%d", len(args))
+	}
 	args = append(args, limit)
 	rows, err := db.Query(fmt.Sprintf(txnSelect+` WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
@@ -902,6 +911,16 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 	} else if from != "" {
 		args = append(args, from, to)
 		where += fmt.Sprintf(" AND tr.created_at::date BETWEEN $%d::date AND $%d::date", len(args)-1, len(args))
+	}
+	// a pocket's transfers are the ones leaving it or arriving in it
+	if p := r.URL.Query().Get("pocket_id"); p != "" {
+		pid, err := strconv.Atoi(p)
+		if err != nil || pid <= 0 {
+			badReq(w, "pocket_id must be a positive integer")
+			return
+		}
+		args = append(args, pid)
+		where += fmt.Sprintf(" AND (tr.from_pocket=$%d OR tr.to_pocket=$%d)", len(args), len(args))
 	}
 	args = append(args, limit)
 	rows, err := db.Query(fmt.Sprintf(`SELECT tr.id, tr.from_pocket, pf.name, tr.to_pocket, pt.name, tr.amount,
@@ -1543,6 +1562,12 @@ type route struct {
 	Handler http.HandlerFunc
 }
 
+func getPocket(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if p, ok := fetchPocket(w, userID, id); ok {
+		writeJSON(w, 200, p)
+	}
+}
+
 func getTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
 	if t, ok := fetchTxn(w, userID, id); ok {
 		writeJSON(w, 200, t)
@@ -1558,6 +1583,7 @@ func allRoutes() []route {
 
 		{"GET", "/v1/pockets", withUser(func(w http.ResponseWriter, r *http.Request, uid int) { getPockets(w, uid) })},
 		{"POST", "/v1/pockets", withUser(createPocket)},
+		{"GET", "/v1/pockets/{id}", withUserID(getPocket)},
 		{"PATCH", "/v1/pockets/{id}", withUserID(updatePocket)},
 		{"DELETE", "/v1/pockets/{id}", withUserID(deletePocket)},
 

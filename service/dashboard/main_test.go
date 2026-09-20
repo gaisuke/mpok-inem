@@ -173,6 +173,124 @@ func TestUpstreamErrorsArePassedThrough(t *testing.T) {
 	}
 }
 
+func TestPocketDetailMergesPocketLedgerAndTransfers(t *testing.T) {
+	var got []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Path+"?"+r.URL.RawQuery)
+		if r.Header.Get("X-User-ID") != "9" {
+			t.Errorf("missing X-User-ID on %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/pockets/3":
+			_, _ = io.WriteString(w, `{"id":3,"name":"Cash","type":"cash","balance_idr":13000}`)
+		case "/v1/transactions":
+			_, _ = io.WriteString(w, `[
+				{"id":2,"direction":"out","amount_idr":25000,"category":"food","note":"kopi","created_at":"2026-09-20T09:05:00+08:00"},
+				{"id":1,"direction":"in","amount_idr":5000,"category":"refund","note":"","created_at":"2026-09-19T08:00:00+08:00"}]`)
+		case "/v1/transfers":
+			_, _ = io.WriteString(w, `[
+				{"id":5,"from_pocket_id":3,"from":"Cash","to":"Savings","amount_idr":50000,"note":"save","created_at":"2026-09-20T10:00:00+08:00"},
+				{"id":6,"from_pocket_id":2,"from":"BRImo","to":"Cash","amount_idr":100000,"note":"","created_at":"2026-09-18T07:00:00+08:00"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := &server{upstream: up.URL, userID: "9", client: up.Client()}
+
+	code, body := get(t, s.handler(), "/api/pocket?id=3&period=month")
+	if code != 200 {
+		t.Fatalf("status %d: %s", code, body)
+	}
+	var d struct {
+		Pocket struct {
+			Name    string `json:"name"`
+			Balance int64  `json:"balance_idr"`
+		} `json:"pocket"`
+		Totals struct {
+			Out, In, TransferOut, TransferIn int64
+		} `json:"totals"`
+		Movements []struct {
+			Kind      string `json:"kind"`
+			Direction string `json:"direction"`
+			Amount    int64  `json:"amount_idr"`
+			Label     string `json:"label"`
+			At        string `json:"at"`
+		} `json:"movements"`
+	}
+	// totals/movement keys are named explicitly in the handler; decode loosely
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if err := json.Unmarshal([]byte(body), &d); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if raw["pocket"].(map[string]any)["name"] != "Cash" {
+		t.Fatalf("pocket passthrough: %s", body)
+	}
+	totals := raw["totals"].(map[string]any)
+	if totals["out_idr"].(float64) != 25000 || totals["in_idr"].(float64) != 5000 ||
+		totals["transfer_out_idr"].(float64) != 50000 || totals["transfer_in_idr"].(float64) != 100000 {
+		t.Fatalf("totals: %v", totals)
+	}
+	// transfers carry the direction relative to *this* pocket, and both kinds are
+	// merged newest-first
+	moves := raw["movements"].([]any)
+	if len(moves) != 4 {
+		t.Fatalf("movements: %v", moves)
+	}
+	first := moves[0].(map[string]any)
+	if first["kind"] != "transfer" || first["direction"] != "out" || first["label"] != "→ Savings · save" {
+		t.Fatalf("outgoing transfer row: %v", first)
+	}
+	second := moves[1].(map[string]any)
+	if second["kind"] != "txn" || second["direction"] != "out" || second["label"] != "kopi" {
+		t.Fatalf("txn row: %v", second)
+	}
+	last := moves[3].(map[string]any)
+	if last["direction"] != "in" || last["label"] != "← BRImo" {
+		t.Fatalf("incoming transfer row: %v", last)
+	}
+	// an empty note falls back to the category
+	if moves[2].(map[string]any)["label"] != "refund" {
+		t.Fatalf("category fallback: %v", moves[2])
+	}
+
+	wantQueries := []string{
+		"/v1/pockets/3?",
+		"/v1/transactions?month=" + time.Now().Format("2006-01") + "&pocket_id=3&limit=500",
+		"/v1/transfers?month=" + time.Now().Format("2006-01") + "&pocket_id=3&limit=500",
+	}
+	if len(got) != len(wantQueries) {
+		t.Fatalf("upstream calls: %v", got)
+	}
+	for i, want := range wantQueries {
+		if got[i] != want {
+			t.Fatalf("call %d = %q, want %q", i, got[i], want)
+		}
+	}
+}
+
+func TestPocketDetailGuards(t *testing.T) {
+	f := &fakeInemd{}
+	s, _ := newFakeDash(t, f)
+	if code, _ := get(t, s.handler(), "/api/pocket"); code != 400 {
+		t.Fatalf("missing id: %d", code)
+	}
+	if code, _ := get(t, s.handler(), "/api/pocket?id=abc"); code != 400 {
+		t.Fatalf("bad id: %d", code)
+	}
+	if code, _ := get(t, s.handler(), "/api/pocket?id=1&period=nonsense"); code != 400 {
+		t.Fatalf("bad period: %d", code)
+	}
+	down := &server{upstream: "http://127.0.0.1:1", userID: "1", client: &http.Client{Timeout: time.Second}}
+	if code, _ := get(t, down.handler(), "/api/pocket?id=1"); code != http.StatusBadGateway {
+		t.Fatalf("unreachable inemd: %d", code)
+	}
+}
+
 func TestPeriodQuery(t *testing.T) {
 	today := time.Now()
 	iso := func(d time.Time) string { return d.Format("2006-01-02") }

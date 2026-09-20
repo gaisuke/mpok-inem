@@ -261,6 +261,14 @@ func TestPocketLifecycleAndGuards(t *testing.T) {
 	}
 	a.want("DELETE", fmt.Sprintf("/v1/pockets/%d?confirm=true", defID), nil, 200)
 
+	// single-pocket read (what a dashboard needs to open one pocket)
+	one := a.obj("GET", fmt.Sprintf("/v1/pockets/%d", cash), nil, 200)
+	if one["name"] != "Cash" || int64(one["balance_idr"].(float64)) != 13000 {
+		t.Fatalf("get pocket: %v", one)
+	}
+	a.want("GET", fmt.Sprintf("/v1/pockets/%d", savings), nil, 200)
+	a.want("GET", "/v1/pockets/9999", nil, 404)
+
 	// patch: rename + retype + opening balance
 	upd := a.obj("PATCH", fmt.Sprintf("/v1/pockets/%d", cash),
 		map[string]any{"name": "Cash ", "type": "savings", "opening_balance_idr": 20000}, 200)
@@ -369,6 +377,22 @@ func TestTransactionLifecycle(t *testing.T) {
 	a.want("GET", "/v1/transactions?limit=0", nil, 400)
 	a.want("GET", "/v1/transactions?limit=501", nil, 400)
 
+	// per-pocket ledger: the view behind "tap a pocket and see what moved"
+	other := a.pocket("Bank", "savings", 0)
+	a.spend(other, "out", 7000, "transport", "ojek")
+	pocketOnly := a.list("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d", cash), 200)
+	if len(pocketOnly) != 1 || int(pocketOnly[0].(map[string]any)["pocket_id"].(float64)) != cash {
+		t.Fatalf("pocket filter: %v", pocketOnly)
+	}
+	if got := len(a.list("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d", other), 200)); got != 1 {
+		t.Fatalf("pocket filter (other pocket): %d", got)
+	}
+	if got := len(a.list("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d&direction=in", cash), 200)); got != 0 {
+		t.Fatalf("pocket+direction filter: %d", got)
+	}
+	a.want("GET", "/v1/transactions?pocket_id=0", nil, 400)
+	a.want("GET", "/v1/transactions?pocket_id=abc", nil, 400)
+
 	one := a.obj("GET", fmt.Sprintf("/v1/transactions/%d", id), nil, 200)
 	if one["note"] != "nasi goreng" || int(one["id"].(float64)) != id {
 		t.Fatalf("get txn: %v", one)
@@ -430,6 +454,19 @@ func TestTransferLifecycle(t *testing.T) {
 	}
 	a.want("GET", "/v1/transfers?month=nope", nil, 400)
 	a.want("GET", "/v1/transfers?limit=0", nil, 400)
+
+	// per-pocket transfers (a move shows up on both sides)
+	if got := len(a.list("GET", fmt.Sprintf("/v1/transfers?pocket_id=%d", cash), 200)); got != 1 {
+		t.Fatalf("source pocket transfers: %d", got)
+	}
+	if got := len(a.list("GET", fmt.Sprintf("/v1/transfers?pocket_id=%d", bank), 200)); got != 1 {
+		t.Fatalf("destination pocket transfers: %d", got)
+	}
+	third := a.pocket("Third", "savings", 0)
+	if got := len(a.list("GET", fmt.Sprintf("/v1/transfers?pocket_id=%d", third), 200)); got != 0 {
+		t.Fatalf("uninvolved pocket transfers: %d", got)
+	}
+	a.want("GET", "/v1/transfers?pocket_id=0", nil, 400)
 
 	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d", id), nil, 400)
 	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", id), nil, 200)

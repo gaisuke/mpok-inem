@@ -73,12 +73,13 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | GET | `/healthz` | liveness |
 | POST | `/internal/v1/handle` | uniform entry contract (PRD TRD §4.2) |
 | GET/POST | `/v1/pockets` | list / create pockets |
+| GET | `/v1/pockets/{id}` | one pocket with its balance |
 | PATCH/DELETE | `/v1/pockets/{id}` | rename/retype/reset a pocket; delete an empty one |
 | POST | `/v1/transactions` | record a transaction |
-| GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `limit`) |
+| GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `pocket_id`, `limit`) |
 | GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, or drop a mistaken entry |
 | POST | `/v1/transfers` | move money between pockets |
-| GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `limit`) |
+| GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `pocket_id`, `limit`) |
 | DELETE | `/v1/transfers/{id}` | drop a mistaken transfer |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
 | POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |
@@ -123,7 +124,9 @@ while other members still had rows (colliding ids on the next INSERT).
 
 `service/dashboard` serves one static page + a GET-only JSON passthrough to
 inemd: ringkasan (period totals, category bars, pocket balances), transaksi,
-notes with search/tag filter, and meals with macros + daily target.
+notes with search/tag filter, and meals with macros + daily target. Tapping a
+pocket opens that pocket's own ledger (`/api/pocket`, which merges the pocket,
+its entries and the transfers in/out of it into one response).
 
 - No write path exists in the binary — only GET routes are registered, so every
   POST/PATCH/DELETE answers 405 and never reaches inemd.

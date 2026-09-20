@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -40,6 +41,7 @@ func (s *server) handler() http.Handler {
 		}
 		return q + "&limit=" + limitOr(r, "100", "500"), nil
 	}))
+	mux.HandleFunc("GET /api/pocket", s.proxyPocketDetail)
 	mux.HandleFunc("GET /api/notes", s.proxyNotes)
 	mux.HandleFunc("GET /api/notes/{id}", s.pass("/v1/notes/{id}", nil))
 	mux.HandleFunc("GET /api/meals", s.pass("/v1/meals", func(r *http.Request) (string, error) {
@@ -102,6 +104,142 @@ func (s *server) pass(path string, q func(*http.Request) (string, error)) http.H
 		}
 		s.forward(w, r, target)
 	}
+}
+
+// proxyPocketDetail serves one pocket's ledger: the pocket itself, its own
+// entries, and the transfers in or out of it — merged into one response so the
+// page does not have to stitch three calls together.
+func (s *server) proxyPocketDetail(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if _, err := fmt.Sscanf(id, "%d", new(int)); id == "" || err != nil {
+		http.Error(w, "id must be a positive integer", http.StatusBadRequest)
+		return
+	}
+	period, err := periodQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	pocket, err := s.fetch("/v1/pockets/" + id)
+	if err != nil {
+		badGateway(w, err.Error())
+		return
+	}
+	txns, err := s.fetch("/v1/transactions" + period + "&pocket_id=" + id + "&limit=500")
+	if err != nil {
+		badGateway(w, err.Error())
+		return
+	}
+	transfers, err := s.fetch("/v1/transfers" + period + "&pocket_id=" + id + "&limit=500")
+	if err != nil {
+		badGateway(w, err.Error())
+		return
+	}
+
+	type movement struct {
+		Kind         string `json:"kind"`
+		ID           int64  `json:"id"`
+		At           string `json:"at"`
+		Direction    string `json:"direction"`
+		AmountIDR    int64  `json:"amount_idr"`
+		Label        string `json:"label"`
+		Category     string `json:"category,omitempty"`
+		Counterparty string `json:"counterparty,omitempty"`
+	}
+	movements := []movement{}
+	var out, in, moveOut, moveIn int64
+
+	var txnRows []struct {
+		ID        int64  `json:"id"`
+		Direction string `json:"direction"`
+		AmountIDR int64  `json:"amount_idr"`
+		Category  string `json:"category"`
+		Note      string `json:"note"`
+		CreatedAt string `json:"created_at"`
+	}
+	if err := json.Unmarshal(txns, &txnRows); err != nil {
+		badGateway(w, "bad transactions payload: "+err.Error())
+		return
+	}
+	for _, t := range txnRows {
+		label := t.Note
+		if label == "" {
+			label = t.Category
+		}
+		movements = append(movements, movement{
+			Kind: "txn", ID: t.ID, At: t.CreatedAt, Direction: t.Direction,
+			AmountIDR: t.AmountIDR, Label: label, Category: t.Category,
+		})
+		if t.Direction == "out" {
+			out += t.AmountIDR
+		} else {
+			in += t.AmountIDR
+		}
+	}
+
+	var transferRows []struct {
+		ID         int64  `json:"id"`
+		FromPocket int    `json:"from_pocket_id"`
+		From       string `json:"from"`
+		To         string `json:"to"`
+		AmountIDR  int64  `json:"amount_idr"`
+		Note       string `json:"note"`
+		CreatedAt  string `json:"created_at"`
+	}
+	if err := json.Unmarshal(transfers, &transferRows); err != nil {
+		badGateway(w, "bad transfers payload: "+err.Error())
+		return
+	}
+	for _, t := range transferRows {
+		dir, counter, label := "in", t.From, "← "+t.From
+		moveIn += t.AmountIDR
+		if fmt.Sprint(t.FromPocket) == id {
+			dir, counter, label = "out", t.To, "→ "+t.To
+			moveIn -= t.AmountIDR
+			moveOut += t.AmountIDR
+		}
+		if t.Note != "" {
+			label += " · " + t.Note
+		}
+		movements = append(movements, movement{
+			Kind: "transfer", ID: t.ID, At: t.CreatedAt, Direction: dir,
+			AmountIDR: t.AmountIDR, Label: label, Counterparty: counter,
+		})
+	}
+
+	sort.SliceStable(movements, func(i, j int) bool { return movements[i].At > movements[j].At })
+
+	resp := map[string]any{
+		"pocket":    json.RawMessage(pocket),
+		"totals":    map[string]any{"out_idr": out, "in_idr": in, "transfer_out_idr": moveOut, "transfer_in_idr": moveIn},
+		"movements": movements,
+		"period":    period,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// fetch is a GET against inemd that returns the body or an error for a non-2xx.
+func (s *server) fetch(target string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, s.upstream+target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-User-ID", s.userID)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("inemd %s: %s", target, strings.TrimSpace(string(body)))
+	}
+	return body, nil
 }
 
 // proxyNotes: list, tag-filter, or full-text search — one endpoint for the page.
