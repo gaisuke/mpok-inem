@@ -251,10 +251,10 @@ func TestPocketLifecycleAndGuards(t *testing.T) {
 	}
 
 	// defaults + validation
-	a.want("POST", "/v1/pockets", map[string]any{"type": "cash"}, 400)                       // no name
-	a.want("POST", "/v1/pockets", map[string]any{"name": "X", "type": "gold"}, 400)          // bad type
-	a.want("POST", "/v1/pockets", map[string]any{"name": "Cash", "type": "cash"}, 400)       // duplicate
-	def := a.obj("POST", "/v1/pockets", map[string]any{"name": "NoType"}, 201) // type defaults to cash
+	a.want("POST", "/v1/pockets", map[string]any{"type": "cash"}, 400)                 // no name
+	a.want("POST", "/v1/pockets", map[string]any{"name": "X", "type": "gold"}, 400)    // bad type
+	a.want("POST", "/v1/pockets", map[string]any{"name": "Cash", "type": "cash"}, 400) // duplicate
+	def := a.obj("POST", "/v1/pockets", map[string]any{"name": "NoType"}, 201)         // type defaults to cash
 	defID := int(def["id"].(float64))
 	if defID == 0 {
 		t.Fatal("default type pocket not created")
