@@ -73,13 +73,31 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | GET | `/healthz` | liveness |
 | POST | `/internal/v1/handle` | uniform entry contract (PRD TRD §4.2) |
 | GET/POST | `/v1/pockets` | list / create pockets |
+| PATCH/DELETE | `/v1/pockets/{id}` | rename/retype/reset a pocket; delete an empty one |
 | POST | `/v1/transactions` | record a transaction |
 | GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `limit`) |
+| GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, or drop a mistaken entry |
 | POST | `/v1/transfers` | move money between pockets |
+| GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `limit`) |
+| DELETE | `/v1/transfers/{id}` | drop a mistaken transfer |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
-| POST/GET | `/v1/notes` | capture / list notes |
-| GET | `/v1/notes/search`, `/v1/notes/{id}` | search, fetch one |
-| POST | `/v1/meals`, GET `/v1/nutrition/daily` | log a meal / daily rollup |
+| POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |
+| GET/PATCH/DELETE | `/v1/notes/{id}` | fetch, edit, delete one note |
+| GET | `/v1/notes/search` | full-text search |
+| POST/GET | `/v1/meals` | log a meal / list meals for a day (`day`, `limit`) |
+| PATCH/DELETE | `/v1/meals/{id}` | fix or drop a meal |
+| GET | `/v1/nutrition/daily` | daily macro rollup (`day`) |
+| GET/PUT/DELETE | `/v1/nutrition/target` | read / set / clear a daily calorie+protein target |
+| GET/POST | `/v1/admin/users` | household roster / link a member |
+| DELETE | `/v1/admin/users/{id}` | unlink a member and wipe their rows |
+| POST | `/v1/admin/reset` | wipe a user's data: `{"confirm":"RESET","scope":"ledger"\|"all"}` |
+
+Destructive calls need an explicit confirmation — `?confirm=true` on DELETE, the
+literal `"RESET"` body on `/v1/admin/reset` — so no stray request deletes data.
+The agent drives all of this through
+`~/.hermes/skills/personal/inem/scripts/inem.py` and never opens psql: every
+household fix (rename a pocket, retype eCard, delete a wrong entry, add a family
+member, reset test data) has an endpoint.
 
 ## Deployment notes
 

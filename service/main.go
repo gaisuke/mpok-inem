@@ -370,34 +370,19 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 		where += fmt.Sprintf(" AND t.direction=$%d", len(args))
 	}
 	args = append(args, limit)
-	rows, err := db.Query(fmt.Sprintf(`SELECT t.id, t.pocket_id, p.name, t.direction, t.amount, t.category,
-		COALESCE(t.note,''), t.created_at
-		FROM expense.transactions t JOIN expense.pockets p ON p.id=t.pocket_id
-		WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
+	rows, err := db.Query(fmt.Sprintf(txnSelect+` WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
 		badReq(w, err.Error())
 		return
 	}
 	defer rows.Close()
-	type txn struct {
-		ID       int64  `json:"id"`
-		PocketID int    `json:"pocket_id"`
-		Pocket   string `json:"pocket"`
-		Direction string `json:"direction"`
-		AmountIDR int64 `json:"amount_idr"`
-		Category string `json:"category"`
-		Note     string `json:"note"`
-		CreatedAt string `json:"created_at"`
-	}
 	out := []txn{}
 	for rows.Next() {
-		var t txn
-		var ts time.Time
-		if err := rows.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &ts); err != nil {
+		t, err := scanTxn(rows)
+		if err != nil {
 			badReq(w, err.Error())
 			return
 		}
-		t.CreatedAt = ts.Format(time.RFC3339)
 		out = append(out, t)
 	}
 	writeJSON(w, 200, out)
@@ -487,7 +472,19 @@ func searchNotes(w http.ResponseWriter, r *http.Request, userID int) {
 }
 
 func listNotes(w http.ResponseWriter, r *http.Request, userID int) {
-	rows, err := db.Query(`SELECT id,title,body_md,tags,updated_at FROM brain.notes WHERE user_id=$1 ORDER BY updated_at DESC LIMIT 50`, userID)
+	limit, msg := limitParam(r, 50, 200)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	where, args := "user_id=$1", []any{userID}
+	if tag := r.URL.Query().Get("tag"); tag != "" {
+		args = append(args, tag)
+		where += fmt.Sprintf(" AND $%d = ANY(tags)", len(args))
+	}
+	args = append(args, limit)
+	rows, err := db.Query(fmt.Sprintf(`SELECT id,title,body_md,tags,updated_at FROM brain.notes
+		WHERE %s ORDER BY updated_at DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -581,7 +578,7 @@ func dailyRollup(w http.ResponseWriter, r *http.Request, userID int) {
 	}
 	var r0 rollup
 	var target sql.NullInt64
-	err := db.QueryRow(`SELECT $1::date, COALESCE(SUM(i.calories),0), COALESCE(SUM(i.protein),0), COALESCE(SUM(i.carbs),0), COALESCE(SUM(i.fat),0),
+	err := db.QueryRow(`SELECT to_char($1::date,'YYYY-MM-DD'), COALESCE(SUM(i.calories),0), COALESCE(SUM(i.protein),0), COALESCE(SUM(i.carbs),0), COALESCE(SUM(i.fat),0),
 		(SELECT calorie_target FROM nutrition.daily_targets WHERE user_id=$2 AND day=$1::date)
 		FROM nutrition.meals m JOIN nutrition.meal_items i ON i.meal_id=m.id
 		WHERE m.user_id=$2 AND m.logged_at=$1::date`, day, userID).
@@ -595,6 +592,926 @@ func dailyRollup(w http.ResponseWriter, r *http.Request, userID int) {
 		r0.Target = &t
 	}
 	writeJSON(w, 200, r0)
+}
+
+// ---------- maintenance / admin ----------
+//
+// Every fix a household asks for has an endpoint here — rename or retype a
+// pocket, correct a note/category, drop a mistaken entry, set a calorie
+// target, add a family member, wipe test data — so the agent never has to open
+// psql (and never bypasses the invariants this service owns). Destructive
+// calls require an explicit confirm so a stray request can't delete data.
+
+func conflict(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusConflict, map[string]string{"error": msg})
+}
+
+func notFound(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": msg})
+}
+
+func confirmOK(r *http.Request) bool { return r.URL.Query().Get("confirm") == "true" }
+
+// withUserID is withUser plus a numeric {id} path value.
+func withUserID(next func(w http.ResponseWriter, r *http.Request, uid, id int)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid, errUID := qID(r.Header.Get("X-User-ID"))
+		id, errID := strconv.Atoi(r.PathValue("id"))
+		if errUID != nil || uid <= 0 || errID != nil || id <= 0 {
+			badReq(w, "X-User-ID header and numeric {id} required")
+			return
+		}
+		next(w, r, uid, id)
+	}
+}
+
+// dateRange validates optional ?from/?to (YYYY-MM-DD); empty means no filter.
+func dateRange(r *http.Request) (from, to, errMsg string) {
+	q := r.URL.Query()
+	from, to = q.Get("from"), q.Get("to")
+	if from == "" && to == "" {
+		return "", "", ""
+	}
+	if from == "" {
+		from = to
+	}
+	if to == "" {
+		to = from
+	}
+	for _, d := range []struct{ name, val string }{{"from", from}, {"to", to}} {
+		if _, err := time.Parse("2006-01-02", d.val); err != nil {
+			return "", "", d.name + " must be YYYY-MM-DD"
+		}
+	}
+	if to < from {
+		return "", "", "to must not be before from"
+	}
+	return from, to, ""
+}
+
+func limitParam(r *http.Request, def, max int) (int, string) {
+	l := r.URL.Query().Get("limit")
+	if l == "" {
+		return def, ""
+	}
+	n, err := strconv.Atoi(l)
+	if err != nil || n <= 0 || n > max {
+		return 0, fmt.Sprintf("limit must be 1..%d", max)
+	}
+	return n, ""
+}
+
+// ---------- expense: pockets and entries ----------
+
+func fetchPocket(w http.ResponseWriter, userID, id int) (pocket, bool) {
+	var p pocket
+	err := db.QueryRow(`SELECT id, name, type, balance FROM (`+balanceSQL+`) q WHERE id=$2`, userID, id).
+		Scan(&p.ID, &p.Name, &p.Type, &p.Balance)
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "pocket not found")
+		return p, false
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return p, false
+	}
+	return p, true
+}
+
+func updatePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var in struct {
+		Name    *string `json:"name"`
+		Type    *string `json:"type"`
+		Opening *int64  `json:"opening_balance_idr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Name == nil && in.Type == nil && in.Opening == nil {
+		badReq(w, "nothing to update: send name, type or opening_balance_idr")
+		return
+	}
+	sets := []string{}
+	args := []any{userID, id}
+	if in.Name != nil {
+		if strings.TrimSpace(*in.Name) == "" {
+			badReq(w, "name must not be empty")
+			return
+		}
+		args = append(args, *in.Name)
+		sets = append(sets, fmt.Sprintf("name=$%d", len(args)))
+	}
+	if in.Type != nil {
+		if *in.Type != "cash" && *in.Type != "savings" && *in.Type != "investment" {
+			badReq(w, "type must be cash|savings|investment")
+			return
+		}
+		args = append(args, *in.Type)
+		sets = append(sets, fmt.Sprintf("type=$%d", len(args)))
+	}
+	if in.Opening != nil {
+		if *in.Opening < 0 {
+			badReq(w, "opening_balance_idr must be >= 0")
+			return
+		}
+		args = append(args, *in.Opening)
+		sets = append(sets, fmt.Sprintf("opening_balance=$%d", len(args)))
+	}
+	res, err := db.Exec(`UPDATE expense.pockets SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") {
+			conflict(w, "pocket name exists")
+			return
+		}
+		badReq(w, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		notFound(w, "pocket not found")
+		return
+	}
+	if p, ok := fetchPocket(w, userID, id); ok {
+		writeJSON(w, 200, p)
+	}
+}
+
+func deletePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	var refs int
+	err := db.QueryRow(`SELECT (SELECT count(*) FROM expense.transactions WHERE pocket_id=$1)
+		+ (SELECT count(*) FROM expense.transfers WHERE from_pocket=$1 OR to_pocket=$1)`, id).Scan(&refs)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if refs > 0 {
+		conflict(w, fmt.Sprintf("pocket has %d entries; delete or move them first", refs))
+		return
+	}
+	res, err := db.Exec(`DELETE FROM expense.pockets WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "pocket not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+type txn struct {
+	ID        int64  `json:"id"`
+	PocketID  int    `json:"pocket_id"`
+	Pocket    string `json:"pocket"`
+	Direction string `json:"direction"`
+	AmountIDR int64  `json:"amount_idr"`
+	Category  string `json:"category"`
+	Note      string `json:"note"`
+	CreatedAt string `json:"created_at"`
+}
+
+const txnSelect = `SELECT t.id, t.pocket_id, p.name, t.direction, t.amount, t.category,
+	COALESCE(t.note,''), t.created_at
+	FROM expense.transactions t JOIN expense.pockets p ON p.id=t.pocket_id`
+
+func scanTxn(s interface{ Scan(...any) error }) (txn, error) {
+	var t txn
+	var ts time.Time
+	err := s.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &ts)
+	t.CreatedAt = ts.Format(time.RFC3339)
+	return t, err
+}
+
+func fetchTxn(w http.ResponseWriter, userID, id int) (txn, bool) {
+	t, err := scanTxn(db.QueryRow(txnSelect+` WHERE t.user_id=$1 AND t.id=$2`, userID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "transaction not found")
+		return t, false
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return t, false
+	}
+	return t, true
+}
+
+// updateTxn: metadata only (note, category). Amounts, pocket and direction stay
+// immutable so a pocket balance can never silently drift from the bank app;
+// a wrong amount is corrected with a compensating entry.
+func updateTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var in struct {
+		Note     *string `json:"note"`
+		Category *string `json:"category"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Note == nil && in.Category == nil {
+		badReq(w, "nothing to update: send note or category")
+		return
+	}
+	sets := []string{}
+	args := []any{userID, id}
+	if in.Note != nil {
+		args = append(args, *in.Note)
+		sets = append(sets, fmt.Sprintf("note=$%d", len(args)))
+	}
+	if in.Category != nil {
+		if strings.TrimSpace(*in.Category) == "" {
+			badReq(w, "category must not be empty")
+			return
+		}
+		args = append(args, *in.Category)
+		sets = append(sets, fmt.Sprintf("category=$%d", len(args)))
+	}
+	res, err := db.Exec(`UPDATE expense.transactions SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		notFound(w, "transaction not found")
+		return
+	}
+	if t, ok := fetchTxn(w, userID, id); ok {
+		writeJSON(w, 200, t)
+	}
+}
+
+func deleteTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	res, err := db.Exec(`DELETE FROM expense.transactions WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "transaction not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+type transfer struct {
+	ID         int64  `json:"id"`
+	FromPocket int    `json:"from_pocket_id"`
+	From       string `json:"from"`
+	ToPocket   int    `json:"to_pocket_id"`
+	To         string `json:"to"`
+	AmountIDR  int64  `json:"amount_idr"`
+	Note       string `json:"note"`
+	CreatedAt  string `json:"created_at"`
+}
+
+func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
+	limit, msg := limitParam(r, 50, 500)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	from, to, msg := dateRange(r)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	where, args := "tr.user_id=$1", []any{userID}
+	if m := r.URL.Query().Get("month"); m != "" {
+		if _, err := time.Parse("2006-01", m); err != nil {
+			badReq(w, "month must be YYYY-MM")
+			return
+		}
+		args = append(args, m)
+		where += fmt.Sprintf(" AND to_char(tr.created_at,'YYYY-MM')=$%d", len(args))
+	} else if from != "" {
+		args = append(args, from, to)
+		where += fmt.Sprintf(" AND tr.created_at::date BETWEEN $%d::date AND $%d::date", len(args)-1, len(args))
+	}
+	args = append(args, limit)
+	rows, err := db.Query(fmt.Sprintf(`SELECT tr.id, tr.from_pocket, pf.name, tr.to_pocket, pt.name, tr.amount,
+		COALESCE(tr.note,''), tr.created_at
+		FROM expense.transfers tr
+		JOIN expense.pockets pf ON pf.id=tr.from_pocket
+		JOIN expense.pockets pt ON pt.id=tr.to_pocket
+		WHERE %s ORDER BY tr.id DESC LIMIT $%d`, where, len(args)), args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []transfer{}
+	for rows.Next() {
+		var t transfer
+		var ts time.Time
+		if err := rows.Scan(&t.ID, &t.FromPocket, &t.From, &t.ToPocket, &t.To, &t.AmountIDR, &t.Note, &ts); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		t.CreatedAt = ts.Format(time.RFC3339)
+		out = append(out, t)
+	}
+	writeJSON(w, 200, out)
+}
+
+func deleteTransfer(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	res, err := db.Exec(`DELETE FROM expense.transfers WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "transfer not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+// ---------- expense: admin ----------
+
+// resetData wipes one user's data. Body: {"confirm":"RESET","scope":"ledger"|"all"}.
+// scope=ledger keeps pockets (and their opening balances); scope=all also drops
+// pockets, notes, meals and targets — the "we were only testing" reset.
+// Identity (inem_auth.users) is never touched.
+func resetData(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Confirm string `json:"confirm"`
+		Scope   string `json:"scope"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Confirm != "RESET" {
+		badReq(w, `confirm must be exactly "RESET"`)
+		return
+	}
+	if in.Scope != "ledger" && in.Scope != "all" {
+		badReq(w, "scope must be ledger|all")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer tx.Rollback()
+	deleted, err := wipeUser(tx, userID, in.Scope == "all")
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"scope": in.Scope, "deleted": deleted})
+}
+
+// wipeUser deletes one user's rows inside tx; all=false keeps pockets (with
+// their opening balances), notes, meals and targets.
+func wipeUser(tx *sql.Tx, userID int, all bool) (map[string]int64, error) {
+	type step struct{ label, query string }
+	steps := []step{
+		{"transactions", `DELETE FROM expense.transactions WHERE user_id=$1`},
+		{"transfers", `DELETE FROM expense.transfers WHERE user_id=$1`},
+	}
+	type seqDef struct{ seq, table string }
+	seqs := []seqDef{
+		{"expense.transactions_id_seq", "expense.transactions"},
+		{"expense.transfers_id_seq", "expense.transfers"},
+	}
+	if all {
+		steps = append(steps,
+			step{"note_links", `DELETE FROM brain.note_links WHERE from_note IN (SELECT id FROM brain.notes WHERE user_id=$1)
+				OR to_note IN (SELECT id FROM brain.notes WHERE user_id=$1)`},
+			step{"notes", `DELETE FROM brain.notes WHERE user_id=$1`},
+			step{"meal_items", `DELETE FROM nutrition.meal_items WHERE meal_id IN (SELECT id FROM nutrition.meals WHERE user_id=$1)`},
+			step{"meals", `DELETE FROM nutrition.meals WHERE user_id=$1`},
+			step{"daily_targets", `DELETE FROM nutrition.daily_targets WHERE user_id=$1`},
+			step{"pockets", `DELETE FROM expense.pockets WHERE user_id=$1`},
+		)
+		seqs = append(seqs,
+			seqDef{"brain.notes_id_seq", "brain.notes"},
+			seqDef{"nutrition.meals_id_seq", "nutrition.meals"},
+			seqDef{"nutrition.meal_items_id_seq", "nutrition.meal_items"},
+			seqDef{"expense.pockets_id_seq", "expense.pockets"},
+		)
+	}
+	deleted := map[string]int64{}
+	for _, s := range steps {
+		res, err := tx.Exec(s.query, userID)
+		if err != nil {
+			return deleted, err
+		}
+		n, _ := res.RowsAffected()
+		deleted[s.label] = n
+	}
+	// Sequences are global to the table: rewinding one while another user still
+	// has rows would hand out colliding ids, so only rewind an empty table.
+	for _, s := range seqs {
+		var rows int
+		if err := tx.QueryRow("SELECT count(*) FROM " + s.table).Scan(&rows); err != nil {
+			return deleted, err
+		}
+		if rows > 0 {
+			continue
+		}
+		if _, err := tx.Exec("ALTER SEQUENCE " + s.seq + " RESTART WITH 1"); err != nil {
+			return deleted, err
+		}
+	}
+	return deleted, nil
+}
+
+// createUser is the bootstrap call that used to need an INSERT by hand:
+// adding a family member is one POST, and pockets are created separately.
+func createUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		TelegramUserID int64  `json:"telegram_user_id"`
+		DisplayName    string `json:"display_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.TelegramUserID <= 0 {
+		badReq(w, "telegram_user_id must be > 0")
+		return
+	}
+	if strings.TrimSpace(in.DisplayName) == "" {
+		badReq(w, "display_name required")
+		return
+	}
+	var id int
+	var name string
+	err := db.QueryRow(`INSERT INTO inem_auth.users(telegram_user_id,display_name) VALUES($1,$2)
+		ON CONFLICT (telegram_user_id) DO UPDATE SET display_name=EXCLUDED.display_name
+		RETURNING id, display_name`, in.TelegramUserID, in.DisplayName).Scan(&id, &name)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	var pockets int
+	_ = db.QueryRow(`SELECT count(*) FROM expense.pockets WHERE user_id=$1`, id).Scan(&pockets)
+	writeJSON(w, 201, map[string]any{"user_id": id, "display_name": name, "pockets": pockets})
+}
+
+// listUsers: the household roster (who is linked, and how many pockets each has).
+func listUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`SELECT u.id, u.telegram_user_id, u.display_name,
+		(SELECT count(*) FROM expense.pockets p WHERE p.user_id=u.id)
+		FROM inem_auth.users u ORDER BY u.id`)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	type member struct {
+		ID             int    `json:"id"`
+		TelegramUserID int64  `json:"telegram_user_id"`
+		DisplayName    string `json:"display_name"`
+		Pockets        int    `json:"pockets"`
+	}
+	out := []member{}
+	for rows.Next() {
+		var m member
+		if err := rows.Scan(&m.ID, &m.TelegramUserID, &m.DisplayName, &m.Pockets); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, 200, out)
+}
+
+// deleteUser removes a member and every row they own (the scope=all wipe, then
+// the identity row). The calling account cannot delete itself.
+func deleteUser(w http.ResponseWriter, r *http.Request, callerID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	if id == callerID {
+		badReq(w, "refusing to delete the calling account")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var exists int
+	err = tx.QueryRow(`SELECT 1 FROM inem_auth.users WHERE id=$1`, id).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "user not found")
+		return
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	deleted, err := wipeUser(tx, id, true)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM inem_auth.users WHERE id=$1`, id); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": 1, "wiped": deleted})
+}
+
+// ---------- brain: note maintenance ----------
+
+func updateNote(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var in struct {
+		Title  *string   `json:"title"`
+		BodyMD *string   `json:"body_md"`
+		Tags   *[]string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Title == nil && in.BodyMD == nil && in.Tags == nil {
+		badReq(w, "nothing to update: send title, body_md or tags")
+		return
+	}
+	sets := []string{}
+	args := []any{userID, id}
+	if in.Title != nil {
+		if strings.TrimSpace(*in.Title) == "" {
+			badReq(w, "title must not be empty")
+			return
+		}
+		args = append(args, *in.Title)
+		sets = append(sets, fmt.Sprintf("title=$%d", len(args)))
+	}
+	if in.BodyMD != nil {
+		args = append(args, *in.BodyMD)
+		sets = append(sets, fmt.Sprintf("body_md=$%d", len(args)))
+	}
+	if in.Tags != nil {
+		args = append(args, pq.Array(*in.Tags))
+		sets = append(sets, fmt.Sprintf("tags=$%d", len(args)))
+	}
+	res, err := db.Exec(`UPDATE brain.notes SET `+strings.Join(sets, ", ")+`, updated_at=now()
+		WHERE user_id=$1 AND id=$2`, args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		notFound(w, "note not found")
+		return
+	}
+	var n note
+	err = db.QueryRow(`SELECT id,title,body_md,tags,updated_at FROM brain.notes WHERE id=$1 AND user_id=$2`, id, userID).
+		Scan(&n.ID, &n.Title, &n.BodyMD, pq.Array(&n.Tags), &n.Updated)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, n)
+}
+
+func deleteNote(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var exists int
+	err = tx.QueryRow(`SELECT 1 FROM brain.notes WHERE id=$1 AND user_id=$2`, id, userID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "note not found")
+		return
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	// brain.note_links has no ON DELETE CASCADE: clear the edges first.
+	if _, err := tx.Exec(`DELETE FROM brain.note_links WHERE from_note=$1 OR to_note=$1`, id); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM brain.notes WHERE id=$1 AND user_id=$2`, id, userID); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": 1})
+}
+
+// ---------- nutrition: meal maintenance + targets ----------
+
+type mealItem struct {
+	ID         int64   `json:"id"`
+	Name       string  `json:"name"`
+	EstGrams   int     `json:"est_grams"`
+	Calories   int     `json:"calories"`
+	Protein    float64 `json:"protein_g"`
+	Carbs      float64 `json:"carbs_g"`
+	Fat        float64 `json:"fat_g"`
+	Confidence float64 `json:"confidence"`
+}
+
+type meal struct {
+	ID        int64      `json:"id"`
+	PhotoRef  string     `json:"photo_ref"`
+	Source    string     `json:"source"`
+	Note      string     `json:"note"`
+	LoggedAt  string     `json:"logged_at"`
+	CreatedAt string     `json:"created_at"`
+	Items     []mealItem `json:"items"`
+}
+
+// listMeals: the entries behind a day's macro rollup (default: today).
+func listMeals(w http.ResponseWriter, r *http.Request, userID int) {
+	day := time.Now().Format("2006-01-02")
+	if d := r.URL.Query().Get("day"); d != "" {
+		if _, err := time.Parse("2006-01-02", d); err != nil {
+			badReq(w, "day must be YYYY-MM-DD")
+			return
+		}
+		day = d
+	}
+	limit, msg := limitParam(r, 50, 200)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	rows, err := db.Query(`SELECT m.id, COALESCE(m.photo_ref,''), m.source, COALESCE(m.note,''), m.logged_at, m.created_at
+		FROM nutrition.meals m WHERE m.user_id=$1 AND m.logged_at=$2::date ORDER BY m.id DESC LIMIT $3`, userID, day, limit)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []meal{}
+	ids := []int64{}
+	for rows.Next() {
+		var m meal
+		var logged, created time.Time
+		if err := rows.Scan(&m.ID, &m.PhotoRef, &m.Source, &m.Note, &logged, &created); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		m.LoggedAt = logged.Format("2006-01-02")
+		m.CreatedAt = created.Format(time.RFC3339)
+		m.Items = []mealItem{}
+		out = append(out, m)
+		ids = append(ids, m.ID)
+	}
+	if len(ids) > 0 {
+		irows, err := db.Query(`SELECT meal_id, id, name, COALESCE(est_grams,0), COALESCE(calories,0),
+			COALESCE(protein,0), COALESCE(carbs,0), COALESCE(fat,0), COALESCE(confidence,0)
+			FROM nutrition.meal_items WHERE meal_id = ANY($1) ORDER BY id`, pq.Array(ids))
+		if err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		defer irows.Close()
+		byMeal := map[int64][]mealItem{}
+		for irows.Next() {
+			var mealID int64
+			var it mealItem
+			if err := irows.Scan(&mealID, &it.ID, &it.Name, &it.EstGrams, &it.Calories, &it.Protein,
+				&it.Carbs, &it.Fat, &it.Confidence); err != nil {
+				badReq(w, err.Error())
+				return
+			}
+			byMeal[mealID] = append(byMeal[mealID], it)
+		}
+		for i := range out {
+			if its, ok := byMeal[out[i].ID]; ok {
+				out[i].Items = its
+			}
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
+func updateMeal(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var in struct {
+		Note     *string `json:"note"`
+		PhotoRef *string `json:"photo_ref"`
+		LoggedAt *string `json:"logged_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Note == nil && in.PhotoRef == nil && in.LoggedAt == nil {
+		badReq(w, "nothing to update: send note, photo_ref or logged_at")
+		return
+	}
+	sets := []string{}
+	args := []any{userID, id}
+	if in.Note != nil {
+		args = append(args, *in.Note)
+		sets = append(sets, fmt.Sprintf("note=$%d", len(args)))
+	}
+	if in.PhotoRef != nil {
+		args = append(args, *in.PhotoRef)
+		sets = append(sets, fmt.Sprintf("photo_ref=$%d", len(args)))
+	}
+	if in.LoggedAt != nil {
+		if _, err := time.Parse("2006-01-02", *in.LoggedAt); err != nil {
+			badReq(w, "logged_at must be YYYY-MM-DD")
+			return
+		}
+		args = append(args, *in.LoggedAt)
+		sets = append(sets, fmt.Sprintf("logged_at=$%d::date", len(args)))
+	}
+	res, err := db.Exec(`UPDATE nutrition.meals SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "meal not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"meal_id": id, "updated": n})
+}
+
+func deleteMeal(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	// meal_items has ON DELETE CASCADE.
+	res, err := db.Exec(`DELETE FROM nutrition.meals WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "meal not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+type target struct {
+	Day      string   `json:"day"`
+	Calories *int     `json:"calorie_target,omitempty"`
+	Protein  *float64 `json:"protein_target,omitempty"`
+}
+
+func targetDay(r *http.Request) (string, string) {
+	day := time.Now().Format("2006-01-02")
+	if d := r.URL.Query().Get("day"); d != "" {
+		if _, err := time.Parse("2006-01-02", d); err != nil {
+			return "", "day must be YYYY-MM-DD"
+		}
+		day = d
+	}
+	return day, ""
+}
+
+func getTarget(w http.ResponseWriter, r *http.Request, userID int) {
+	day, msg := targetDay(r)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	var t target
+	var cal sql.NullInt64
+	var prot sql.NullFloat64
+	err := db.QueryRow(`SELECT day::text, calorie_target, protein_target FROM nutrition.daily_targets
+		WHERE user_id=$1 AND day=$2::date`, userID, day).Scan(&t.Day, &cal, &prot)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, 200, target{Day: day})
+		return
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if cal.Valid {
+		c := int(cal.Int64)
+		t.Calories = &c
+	}
+	if prot.Valid {
+		p := prot.Float64
+		t.Protein = &p
+	}
+	writeJSON(w, 200, t)
+}
+
+func putTarget(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Day      string   `json:"day"`
+		Calories *int     `json:"calorie_target"`
+		Protein  *float64 `json:"protein_target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	day := in.Day
+	if day == "" {
+		day = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", day); err != nil {
+		badReq(w, "day must be YYYY-MM-DD")
+		return
+	}
+	if in.Calories == nil && in.Protein == nil {
+		badReq(w, "nothing to set: send calorie_target and/or protein_target")
+		return
+	}
+	if in.Calories != nil && *in.Calories <= 0 {
+		badReq(w, "calorie_target must be > 0")
+		return
+	}
+	var cal any
+	if in.Calories != nil {
+		cal = *in.Calories
+	}
+	var prot any
+	if in.Protein != nil {
+		prot = *in.Protein
+	}
+	var out target
+	var c sql.NullInt64
+	var p sql.NullFloat64
+	err := db.QueryRow(`INSERT INTO nutrition.daily_targets(user_id,day,calorie_target,protein_target)
+		VALUES($1,$2::date,$3,$4)
+		ON CONFLICT (user_id,day) DO UPDATE
+		SET calorie_target=COALESCE(EXCLUDED.calorie_target, nutrition.daily_targets.calorie_target),
+		    protein_target=COALESCE(EXCLUDED.protein_target, nutrition.daily_targets.protein_target)
+		RETURNING day::text, calorie_target, protein_target`, userID, day, cal, prot).Scan(&out.Day, &c, &p)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if c.Valid {
+		v := int(c.Int64)
+		out.Calories = &v
+	}
+	if p.Valid {
+		v := p.Float64
+		out.Protein = &v
+	}
+	writeJSON(w, 200, out)
+}
+
+func deleteTarget(w http.ResponseWriter, r *http.Request, userID int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	day, msg := targetDay(r)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	res, err := db.Exec(`DELETE FROM nutrition.daily_targets WHERE user_id=$1 AND day=$2::date`, userID, day)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "no target for that day")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n, "day": day})
 }
 
 // ---------- routing / auth ----------
@@ -641,14 +1558,31 @@ func main() {
 
 	mux.HandleFunc("GET /v1/pockets", withUser(func(w http.ResponseWriter, r *http.Request, uid int) { getPockets(w, uid) }))
 	mux.HandleFunc("POST /v1/pockets", withUser(createPocket))
+	mux.HandleFunc("PATCH /v1/pockets/{id}", withUserID(updatePocket))
+	mux.HandleFunc("DELETE /v1/pockets/{id}", withUserID(deletePocket))
 	mux.HandleFunc("POST /v1/transactions", withUser(createTxn))
 	mux.HandleFunc("GET /v1/transactions", withUser(listTxns))
+	mux.HandleFunc("GET /v1/transactions/{id}", withUserID(func(w http.ResponseWriter, r *http.Request, uid, id int) {
+		if t, ok := fetchTxn(w, uid, id); ok {
+			writeJSON(w, 200, t)
+		}
+	}))
+	mux.HandleFunc("PATCH /v1/transactions/{id}", withUserID(updateTxn))
+	mux.HandleFunc("DELETE /v1/transactions/{id}", withUserID(deleteTxn))
 	mux.HandleFunc("POST /v1/transfers", withUser(createTransfer))
+	mux.HandleFunc("GET /v1/transfers", withUser(listTransfers))
+	mux.HandleFunc("DELETE /v1/transfers/{id}", withUserID(deleteTransfer))
 	mux.HandleFunc("GET /v1/expense/summary", withUser(expenseSummary))
+	mux.HandleFunc("POST /v1/admin/reset", withUser(resetData))
+	mux.HandleFunc("POST /v1/admin/users", createUser)
+	mux.HandleFunc("GET /v1/admin/users", listUsers)
+	mux.HandleFunc("DELETE /v1/admin/users/{id}", withUserID(deleteUser))
 
 	mux.HandleFunc("POST /v1/notes", withUser(createNote))
 	mux.HandleFunc("GET /v1/notes", withUser(listNotes))
 	mux.HandleFunc("GET /v1/notes/search", withUser(searchNotes))
+	mux.HandleFunc("PATCH /v1/notes/{id}", withUserID(updateNote))
+	mux.HandleFunc("DELETE /v1/notes/{id}", withUserID(deleteNote))
 	mux.HandleFunc("GET /v1/notes/{id}", func(w http.ResponseWriter, r *http.Request) {
 		uid, err := qID(r.Header.Get("X-User-ID"))
 		id, err2 := qID(r.PathValue("id"))
@@ -660,7 +1594,13 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /v1/meals", withUser(createMeal))
+	mux.HandleFunc("GET /v1/meals", withUser(listMeals))
+	mux.HandleFunc("PATCH /v1/meals/{id}", withUserID(updateMeal))
+	mux.HandleFunc("DELETE /v1/meals/{id}", withUserID(deleteMeal))
 	mux.HandleFunc("GET /v1/nutrition/daily", withUser(dailyRollup))
+	mux.HandleFunc("GET /v1/nutrition/target", withUser(getTarget))
+	mux.HandleFunc("PUT /v1/nutrition/target", withUser(putTarget))
+	mux.HandleFunc("DELETE /v1/nutrition/target", withUser(deleteTarget))
 
 	addr := os.Getenv("INEM_ADDR")
 	if addr == "" {
