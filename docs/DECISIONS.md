@@ -158,6 +158,14 @@ explicitly. The rules that keep this from leaking:
   balance is marked settled without inventing an entry.
 - **A plan cannot overdraw silently**: if the source pocket would go negative the
   entry is still recorded (it mirrors reality) and the response says so plainly.
+- **Some monthly moves have no fixed figure** (what he sends from BRImo to Jago
+  depends on what he keeps back; what he sends on to Pipit's SeaBank is "sometimes
+  6jt, sometimes 7jt"). Such a plan stores no amount (`amount NULL`) and is shown
+  as "nominal menyusul": booking it asks for the real number instead of inventing
+  one, and the override is accepted only together with a single plan id so a
+  figure can never be applied to the wrong row. A plan may also pay another
+  member's *shared* pocket (the monthly transfer to his wife); if that pocket is
+  unshared later, the plan skips rather than writing into a pocket he cannot see.
 - **Reminder is deterministic** (no LLM, empty output sends nothing) so it cannot
   become daily noise, and plans are read-only in the dashboard.
 

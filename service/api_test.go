@@ -1322,6 +1322,99 @@ func TestScheduleWarnsWhenTheSourceGoesNegative(t *testing.T) {
 	}
 }
 
+// A plan whose figure varies month to month is a checklist item, not a contract:
+// it asks for the real number instead of assuming one.
+func TestVariableAmountPlan(t *testing.T) {
+	a := newAPI(t)
+	now := time.Now()
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	pipit := mkUser(t, a.conn, 2, "Pipit")
+	herSeabank := int(a.reqJSONObj("POST", "/v1/pockets", pipit, map[string]any{
+		"name": "seabank", "type": "cash", "opening_balance_idr": 0, "visibility": "shared"}, 201)["id"].(float64))
+
+	brimo := a.pocket("BRImo", "cash", 20000000)
+	jago := a.pocket("Jago Utama", "cash", 0)
+
+	// a plan with no figure: "what is left after I keep 1,4jt in BRImo"
+	v := a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": brimo, "to_pocket_id": jago, "day_of_month": 1,
+		"note": "sisa gaji ke Jago"}, 201)
+	vID := int(v["id"].(float64))
+	row := a.list("GET", "/v1/schedules", 200)[0].(map[string]any)
+	if row["amount_idr"] != nil || row["variable"] != true {
+		t.Fatalf("a plan without a figure should say so: %v", row)
+	}
+
+	// booking it without a figure books nothing and explains why
+	run := a.obj("POST", "/v1/schedules/run", map[string]any{"date": first, "ids": []int{vID}}, 200)
+	if len(run["ran"].([]any)) != 0 || !bodyContains([]byte(fmt.Sprint(run["skipped"])), "nominal") {
+		t.Fatalf("a variable plan must ask for its figure: %v", run)
+	}
+	if got := a.balanceOf(a.uid, jago); got != 0 {
+		t.Fatalf("nothing should have moved: %d", got)
+	}
+
+	// with the real figure it books that figure
+	run = a.obj("POST", "/v1/schedules/run", map[string]any{
+		"date": first, "ids": []int{vID}, "amount_idr": 11000000}, 200)
+	if len(run["ran"].([]any)) != 1 || int64(run["ran"].([]any)[0].(map[string]any)["amount_idr"].(float64)) != 11000000 {
+		t.Fatalf("booking with the real figure: %v", run)
+	}
+	if got := a.balanceOf(a.uid, jago); got != 11000000 {
+		t.Fatalf("jago after the move: %d", got)
+	}
+	if got := a.balanceOf(a.uid, brimo); got != 9000000 {
+		t.Fatalf("brimo after the move: %d", got)
+	}
+	// an override belongs to exactly one plan
+	a.want("POST", "/v1/schedules/run", map[string]any{"date": first, "amount_idr": 1000}, 400)
+	a.want("POST", "/v1/schedules/run", map[string]any{
+		"date": first, "ids": []int{vID, vID}, "amount_idr": 1000}, 400)
+	a.want("POST", "/v1/schedules/run", map[string]any{"date": first, "ids": []int{vID}, "amount_idr": 0}, 400)
+	// a fixed plan can be turned into a variable one
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", vID), map[string]any{"amount_idr": 9000000}, 200)
+	if got := a.list("GET", "/v1/schedules", 200)[0].(map[string]any)["amount_idr"]; int64(got.(float64)) != 9000000 {
+		t.Fatalf("amount did not stick: %v", got)
+	}
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", vID), map[string]any{"variable": true}, 200)
+	if got := a.list("GET", "/v1/schedules", 200)[0].(map[string]any)["amount_idr"]; got != nil {
+		t.Fatalf("variable should clear the figure: %v", got)
+	}
+
+	// a monthly plan may pay another member — "I send my wife 6-7jt every month"
+	toHer := a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": jago, "to_pocket_id": herSeabank, "amount_idr": 6500000,
+		"day_of_month": 2, "note": "kirim ke seabank Pipit"}, 201)
+	toHerID := int(toHer["id"].(float64))
+	// if she stops sharing it, the plan skips instead of writing into a pocket I
+	// can no longer see
+	a.reqJSONObj("PATCH", fmt.Sprintf("/v1/pockets/%d", herSeabank), pipit, map[string]any{"visibility": "private"}, 200)
+	run = a.obj("POST", "/v1/schedules/run", map[string]any{"date": first, "ids": []int{toHerID}}, 200)
+	if len(run["ran"].([]any)) != 0 || !bodyContains([]byte(fmt.Sprint(run["skipped"])), "dibagikan") {
+		t.Fatalf("an unshared destination should skip: %v", run)
+	}
+	if got := int64(a.reqJSON("GET", fmt.Sprintf("/v1/pockets/%d", herSeabank), pipit)["balance_idr"].(float64)); got != 0 {
+		t.Fatalf("her pocket should be untouched: %d", got)
+	}
+	// shared again, it books and she can see the money arrive
+	a.reqJSONObj("PATCH", fmt.Sprintf("/v1/pockets/%d", herSeabank), pipit, map[string]any{"visibility": "shared"}, 200)
+	run = a.obj("POST", "/v1/schedules/run", map[string]any{"date": first, "ids": []int{toHerID}}, 200)
+	if len(run["ran"].([]any)) != 1 {
+		t.Fatalf("booking to her pocket: %v", run)
+	}
+	if got := a.balanceOf(a.uid, herSeabank); got != 6500000 {
+		t.Fatalf("her seabank after the monthly transfer: %d", got)
+	}
+	herRows := a.reqList("GET", "/v1/transfers", pipit)
+	if len(herRows) != 1 || herRows[0].(map[string]any)["from_user"] != "Test Dani" {
+		t.Fatalf("she should see the incoming monthly transfer: %v", herRows)
+	}
+	// and a plan may not point at a pocket the planner cannot see
+	mine := a.pocket("Dana Darurat", "savings", 0) // mine, private
+	a.reqJSONObj("POST", "/v1/schedules", pipit, map[string]any{
+		"from_pocket_id": herSeabank, "to_pocket_id": mine, "amount_idr": 1000, "day_of_month": 3}, 400)
+}
+
 func TestAuthHeaderAndCrossUserIsolation(t *testing.T) {
 	a := newAPI(t)
 	other := mkUser(t, a.conn, 2, "Istri")

@@ -343,7 +343,7 @@ async function loadSchedules() {
         ? `${esc(s.from)} → ${esc(s.to)}` : `masuk → ${esc(s.to)}`;
       return `<li><div class="top">
         <span class="name">${route}</span>
-        <span class="amt">${num(s.amount_idr)}</span>
+        <span class="amt">${s.variable ? 'nominal menyusul' : num(s.amount_idr)}</span>
       </div><div class="meta">tgl ${s.day_of_month} · ${esc(s.due_date)}
         · <span class="pill">${esc(mark[s.status] || s.status)}</span>
         ${s.active ? '' : '<span class="pill">nonaktif</span>'}
