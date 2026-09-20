@@ -455,11 +455,14 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 // household: every member's *shared* pockets, for the family view. Private
 // pockets never leave their owner, and this endpoint is read-only — a shared
 // pocket can be looked at by the others, never written to by them.
+//
+// The caller's own row comes first, so each member opens the view on their own
+// money: Dani sees Dani → Pipit, Pipit sees Pipit → Dani.
 func household(w http.ResponseWriter, r *http.Request, userID int) {
-	rows, err := db.Query(`SELECT u.id, u.display_name, p.id, p.name, p.type, p.visibility,` + balanceExpr + ` AS balance
+	rows, err := db.Query(`SELECT u.id, u.display_name, p.id, p.name, p.type, p.visibility,`+balanceExpr+` AS balance
 		FROM inem_auth.users u
 		JOIN expense.pockets p ON p.user_id=u.id AND p.visibility='shared'
-		ORDER BY u.id, p.id`)
+		ORDER BY (u.id = $1) DESC, u.id, p.id`, userID)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -489,7 +492,10 @@ func household(w http.ResponseWriter, r *http.Request, userID int) {
 		m.TotalIDR += p.Balance
 		grand += p.Balance
 	}
-	writeJSON(w, 200, map[string]any{"members": members, "total_balance_idr": grand})
+	resp := map[string]any{
+		"members": members, "total_balance_idr": grand, "you": userID,
+	}
+	writeJSON(w, 200, resp)
 }
 
 // ---------- brain ----------

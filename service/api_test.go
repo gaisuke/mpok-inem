@@ -878,6 +878,20 @@ func TestPocketSharingIsReadOnlyAndOptIn(t *testing.T) {
 	if len(mineHouse["members"].([]any)) != 2 {
 		t.Fatalf("household should list both members: %v", mineHouse)
 	}
+	if int(mineHouse["you"].(float64)) != a.uid {
+		t.Fatalf("household should say who is asking: %v", mineHouse["you"])
+	}
+	// each member opens the view on their own money
+	if got := mineHouse["members"].([]any)[0].(map[string]any)["display_name"]; got != "Test Dani" {
+		t.Fatalf("my household view should start with me, got %v", got)
+	}
+	herHouse := a.reqJSON("GET", "/v1/household", pipit)
+	if got := herHouse["members"].([]any)[0].(map[string]any)["display_name"]; got != "Pipit" {
+		t.Fatalf("her household view should start with her, got %v", got)
+	}
+	if got := herHouse["members"].([]any)[1].(map[string]any)["display_name"]; got != "Test Dani" {
+		t.Fatalf("her household view should list me second, got %v", got)
+	}
 	if body := fmt.Sprint(mineHouse); bodyContains([]byte(body), "BRImo Pipit") {
 		t.Fatalf("her private pocket leaked into the household view: %s", body)
 	}

@@ -230,8 +230,12 @@ async function loadHousehold() {
       box.innerHTML = '<h2>Anggota</h2><p class="empty">Belum ada dompet yang dibagikan.</p>';
       return;
     }
-    box.innerHTML = members.map(m => `
-      <h2>${esc(m.display_name)} — ${num(m.total_idr)}</h2>
+    // the service puts the caller's own row first; label it so it is obvious
+    const hasMine = members.some(m => m.user_id === d.you);
+    const hint = hasMine ? '' :
+      '<p class="empty">Dompetmu belum ada yang dibagikan — bilang saja "bagikan &lt;nama dompet&gt;" supaya muncul di sini.</p>';
+    box.innerHTML = hint + members.map(m => `
+      <h2>${esc(m.display_name)} — ${num(m.total_idr)}${m.user_id === d.you ? ' <span class="pill">kamu</span>' : ''}</h2>
       <ul>${m.pockets.map(p => `
         <li class="tappable" data-pocket="${p.id}"><div class="top">
           <span class="name">${esc(p.name)}</span>
