@@ -420,6 +420,9 @@ func createNote(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, "title required")
 		return
 	}
+	if in.Tags == nil {
+		in.Tags = []string{} // tags is NOT NULL; a request without tags means "no tags"
+	}
 	var n note
 	err := db.QueryRow(`INSERT INTO brain.notes(user_id,title,body_md,tags) VALUES($1,$2,$3,$4)
 		RETURNING id,title,body_md,tags,updated_at`, userID, in.Title, in.BodyMD, pq.Array(in.Tags)).Scan(&n.ID, &n.Title, &n.BodyMD, pq.Array(&n.Tags), &n.Updated)
@@ -612,11 +615,14 @@ func notFound(w http.ResponseWriter, msg string) {
 
 func confirmOK(r *http.Request) bool { return r.URL.Query().Get("confirm") == "true" }
 
+// pathID reads a numeric path value ({id}) off a request.
+func pathID(r *http.Request, key string) (int, error) { return strconv.Atoi(r.PathValue(key)) }
+
 // withUserID is withUser plus a numeric {id} path value.
 func withUserID(next func(w http.ResponseWriter, r *http.Request, uid, id int)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, errUID := qID(r.Header.Get("X-User-ID"))
-		id, errID := strconv.Atoi(r.PathValue("id"))
+		id, errID := pathID(r, "id")
 		if errUID != nil || uid <= 0 || errID != nil || id <= 0 {
 			badReq(w, "X-User-ID header and numeric {id} required")
 			return
@@ -1529,84 +1535,106 @@ func withUser(next func(w http.ResponseWriter, r *http.Request, uid int)) http.H
 	}
 }
 
+// route is one registered endpoint. main() registers exactly this table and the
+// test suite walks the same table, so an endpoint cannot ship uncovered.
+type route struct {
+	Method  string
+	Pattern string
+	Handler http.HandlerFunc
+}
+
+func getTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if t, ok := fetchTxn(w, userID, id); ok {
+		writeJSON(w, 200, t)
+	}
+}
+
+func allRoutes() []route {
+	return []route{
+		{"GET", "/healthz", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 200, map[string]string{"status": "ok", "service": "inemd", "version": "0.1.0"})
+		}},
+		{"POST", "/internal/v1/handle", handlePOST},
+
+		{"GET", "/v1/pockets", withUser(func(w http.ResponseWriter, r *http.Request, uid int) { getPockets(w, uid) })},
+		{"POST", "/v1/pockets", withUser(createPocket)},
+		{"PATCH", "/v1/pockets/{id}", withUserID(updatePocket)},
+		{"DELETE", "/v1/pockets/{id}", withUserID(deletePocket)},
+
+		{"POST", "/v1/transactions", withUser(createTxn)},
+		{"GET", "/v1/transactions", withUser(listTxns)},
+		{"GET", "/v1/transactions/{id}", withUserID(getTxn)},
+		{"PATCH", "/v1/transactions/{id}", withUserID(updateTxn)},
+		{"DELETE", "/v1/transactions/{id}", withUserID(deleteTxn)},
+
+		{"POST", "/v1/transfers", withUser(createTransfer)},
+		{"GET", "/v1/transfers", withUser(listTransfers)},
+		{"DELETE", "/v1/transfers/{id}", withUserID(deleteTransfer)},
+
+		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
+
+		{"POST", "/v1/admin/reset", withUser(resetData)},
+		{"GET", "/v1/admin/users", listUsers},
+		{"POST", "/v1/admin/users", createUser},
+		{"DELETE", "/v1/admin/users/{id}", withUserID(deleteUser)},
+
+		{"POST", "/v1/notes", withUser(createNote)},
+		{"GET", "/v1/notes", withUser(listNotes)},
+		{"GET", "/v1/notes/search", withUser(searchNotes)},
+		{"GET", "/v1/notes/{id}", withUserID(getNote)},
+		{"PATCH", "/v1/notes/{id}", withUserID(updateNote)},
+		{"DELETE", "/v1/notes/{id}", withUserID(deleteNote)},
+
+		{"POST", "/v1/meals", withUser(createMeal)},
+		{"GET", "/v1/meals", withUser(listMeals)},
+		{"PATCH", "/v1/meals/{id}", withUserID(updateMeal)},
+		{"DELETE", "/v1/meals/{id}", withUserID(deleteMeal)},
+		{"GET", "/v1/nutrition/daily", withUser(dailyRollup)},
+		{"GET", "/v1/nutrition/target", withUser(getTarget)},
+		{"PUT", "/v1/nutrition/target", withUser(putTarget)},
+		{"DELETE", "/v1/nutrition/target", withUser(deleteTarget)},
+	}
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	for _, rt := range allRoutes() {
+		mux.Handle(rt.Method+" "+rt.Pattern, rt.Handler)
+	}
+	return mux
+}
+
+func openDB(dsn string) (*sql.DB, error) {
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetMaxOpenConns(8)
+	for i := 0; i < 10; i++ {
+		if err = conn.Ping(); err == nil {
+			return conn, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("db unreachable: %w", err)
+}
+
 func main() {
 	dsn := os.Getenv("INEM_DSN")
 	if dsn == "" {
 		dsn = "postgres://inem@127.0.0.1:5432/inem?sslmode=disable"
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = openDB(dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
-	db.SetMaxOpenConns(8)
-	for i := 0; i < 10; i++ {
-		if err = db.Ping(); err == nil {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		log.Fatal("db unreachable: ", err)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]string{"status": "ok", "service": "inemd", "version": "0.1.0"})
-	})
-	mux.HandleFunc("POST /internal/v1/handle", handlePOST)
-
-	mux.HandleFunc("GET /v1/pockets", withUser(func(w http.ResponseWriter, r *http.Request, uid int) { getPockets(w, uid) }))
-	mux.HandleFunc("POST /v1/pockets", withUser(createPocket))
-	mux.HandleFunc("PATCH /v1/pockets/{id}", withUserID(updatePocket))
-	mux.HandleFunc("DELETE /v1/pockets/{id}", withUserID(deletePocket))
-	mux.HandleFunc("POST /v1/transactions", withUser(createTxn))
-	mux.HandleFunc("GET /v1/transactions", withUser(listTxns))
-	mux.HandleFunc("GET /v1/transactions/{id}", withUserID(func(w http.ResponseWriter, r *http.Request, uid, id int) {
-		if t, ok := fetchTxn(w, uid, id); ok {
-			writeJSON(w, 200, t)
-		}
-	}))
-	mux.HandleFunc("PATCH /v1/transactions/{id}", withUserID(updateTxn))
-	mux.HandleFunc("DELETE /v1/transactions/{id}", withUserID(deleteTxn))
-	mux.HandleFunc("POST /v1/transfers", withUser(createTransfer))
-	mux.HandleFunc("GET /v1/transfers", withUser(listTransfers))
-	mux.HandleFunc("DELETE /v1/transfers/{id}", withUserID(deleteTransfer))
-	mux.HandleFunc("GET /v1/expense/summary", withUser(expenseSummary))
-	mux.HandleFunc("POST /v1/admin/reset", withUser(resetData))
-	mux.HandleFunc("POST /v1/admin/users", createUser)
-	mux.HandleFunc("GET /v1/admin/users", listUsers)
-	mux.HandleFunc("DELETE /v1/admin/users/{id}", withUserID(deleteUser))
-
-	mux.HandleFunc("POST /v1/notes", withUser(createNote))
-	mux.HandleFunc("GET /v1/notes", withUser(listNotes))
-	mux.HandleFunc("GET /v1/notes/search", withUser(searchNotes))
-	mux.HandleFunc("PATCH /v1/notes/{id}", withUserID(updateNote))
-	mux.HandleFunc("DELETE /v1/notes/{id}", withUserID(deleteNote))
-	mux.HandleFunc("GET /v1/notes/{id}", func(w http.ResponseWriter, r *http.Request) {
-		uid, err := qID(r.Header.Get("X-User-ID"))
-		id, err2 := qID(r.PathValue("id"))
-		if err != nil || err2 != nil {
-			badReq(w, "X-User-ID and note id required")
-			return
-		}
-		getNote(w, r, uid, id)
-	})
-
-	mux.HandleFunc("POST /v1/meals", withUser(createMeal))
-	mux.HandleFunc("GET /v1/meals", withUser(listMeals))
-	mux.HandleFunc("PATCH /v1/meals/{id}", withUserID(updateMeal))
-	mux.HandleFunc("DELETE /v1/meals/{id}", withUserID(deleteMeal))
-	mux.HandleFunc("GET /v1/nutrition/daily", withUser(dailyRollup))
-	mux.HandleFunc("GET /v1/nutrition/target", withUser(getTarget))
-	mux.HandleFunc("PUT /v1/nutrition/target", withUser(putTarget))
-	mux.HandleFunc("DELETE /v1/nutrition/target", withUser(deleteTarget))
 
 	addr := os.Getenv("INEM_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:8777"
 	}
-	srv := &http.Server{Addr: addr, Handler: mux, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: newMux(), ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second}
 	log.Printf("inemd listening on %s", addr)
 	log.Fatal(srv.ListenAndServe())
 }

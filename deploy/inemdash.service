@@ -1,0 +1,27 @@
+[Unit]
+Description=Mpok Inem read-only dashboard (inemdash)
+Documentation=https://github.com/gaisuke/mpok-inem
+After=network-online.target inemd.service
+Wants=inemd.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/inem-dash.env
+ExecStart=/home/ubuntu/mpok-inem/bin/inemdash
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

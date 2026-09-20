@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mpok Inem — dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --line: #262b36; --ink: #e8ecf3;
+    --dim: #9aa4b8; --accent: #6ea8fe; --out: #ff8f8f; --in: #7ee2a8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 16px 0; }
+  h1 { margin: 0; font-size: 18px; letter-spacing: .2px; }
+  h1 small { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .tabs { display: flex; gap: 6px; overflow-x: auto; padding: 12px 16px 0; }
+  .tabs button { background: var(--card); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 999px; padding: 7px 14px; font-size: 13px; white-space: nowrap; }
+  .tabs button[aria-selected=true] { color: var(--ink); border-color: var(--accent); }
+  main { padding: 14px 16px 48px; max-width: 820px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  select, input, button.act { background: var(--card); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 10px; font-size: 14px; }
+  input { flex: 1 1 180px; }
+  button.act { border-color: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+  .card .k { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .card .v { font-size: 20px; font-weight: 600; margin-top: 4px; }
+  .card .v.out { color: var(--out); } .card .v.in { color: var(--in); }
+  .card .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 22px 0 8px; font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 12px; margin-bottom: 8px; }
+  li .top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  li .name { font-weight: 600; }
+  li .amt { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  li .amt.out { color: var(--out); } li .amt.in { color: var(--in); }
+  li .meta { color: var(--dim); font-size: 12.5px; margin-top: 3px; }
+  li .body { margin-top: 8px; color: #cfd6e4; font-size: 13.5px; white-space: pre-wrap; }
+  .pill { display: inline-block; background: #202634; color: var(--dim); border-radius: 999px;
+    padding: 2px 8px; font-size: 11.5px; margin-right: 6px; }
+  .empty, .err { color: var(--dim); font-size: 13.5px; padding: 8px 2px; }
+  .err { color: var(--out); }
+  .bar { height: 6px; background: #202634; border-radius: 4px; margin-top: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .click { cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mpok Inem <small id="stamp"></small></h1>
+  <div class="tabs" role="tablist">
+    <button data-tab="ringkasan" aria-selected="true">Ringkasan</button>
+    <button data-tab="transaksi">Transaksi</button>
+    <button data-tab="notes">Notes</button>
+    <button data-tab="meals">Meals</button>
+  </div>
+</header>
+<main>
+  <section id="ringkasan" class="active">
+    <div class="row">
+      <select id="period">
+        <option value="today">Hari ini</option>
+        <option value="week" selected>Minggu ini</option>
+        <option value="last-week">Minggu lalu</option>
+        <option value="month">Bulan ini</option>
+        <option value="last-month">Bulan lalu</option>
+      </select>
+      <button class="act" id="refresh">Muat ulang</button>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="k">Keluar</div><div class="v out" id="sum-out">—</div><div class="sub" id="sum-period"></div></div>
+      <div class="card"><div class="k">Masuk</div><div class="v in" id="sum-in">—</div><div class="sub">periode terpilih</div></div>
+      <div class="card"><div class="k">Total saldo</div><div class="v" id="sum-total">—</div><div class="sub" id="sum-pockets"></div></div>
+    </div>
+    <h2>Pengeluaran per kategori</h2>
+    <ul id="cats"></ul>
+    <h2>Saldo dompet</h2>
+    <ul id="pockets"></ul>
+  </section>
+
+  <section id="transaksi">
+    <div class="row">
+      <select id="txn-period">
+        <option value="today">Hari ini</option>
+        <option value="week" selected>Minggu ini</option>
+        <option value="last-week">Minggu lalu</option>
+        <option value="month">Bulan ini</option>
+        <option value="last-month">Bulan lalu</option>
+      </select>
+      <button class="act" id="txn-refresh">Muat ulang</button>
+    </div>
+    <ul id="txns"></ul>
+  </section>
+
+  <section id="notes">
+    <div class="row">
+      <input id="note-q" type="search" placeholder="cari isi note…" autocomplete="off">
+      <input id="note-tag" type="search" placeholder="tag" size="8" autocomplete="off">
+      <button class="act" id="note-refresh">Cari</button>
+    </div>
+    <ul id="notes-list"></ul>
+  </section>
+
+  <section id="meals">
+    <div class="row">
+      <input id="meal-day" type="date">
+      <button class="act" id="meal-refresh">Muat ulang</button>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="k">Kalori</div><div class="v" id="macro-cal">—</div><div class="sub" id="macro-target"></div></div>
+      <div class="card"><div class="k">Protein / Karbo / Lemak</div><div class="v" id="macro-pcf">—</div><div class="sub">gram</div></div>
+    </div>
+    <h2>Riwayat makan</h2>
+    <ul id="meals-list"></ul>
+  </section>
+</main>
+<script>
+const idr = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 });
+const BASE = location.pathname.replace(/\/+$/, ''); // '' at the root, '/inem' behind a reverse proxy
+const num = (n) => idr.format(n || 0);
+const esc = (s) => (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const $ = (id) => document.getElementById(id);
+
+async function api(path) {
+  const res = await fetch(BASE + path);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+  if (!res.ok) throw new Error((data && data.error) || res.status + ' ' + res.statusText);
+  return data;
+}
+const fail = (el, msg) => { el.innerHTML = '<li class="err">' + esc(msg) + '</li>'; };
+const empty = (el, msg) => { el.innerHTML = '<li class="empty">' + esc(msg) + '</li>'; };
+
+let pocketsById = {};
+let allPockets = [];
+
+async function loadPockets() {
+  allPockets = await api('/api/pockets');
+  pocketsById = Object.fromEntries(allPockets.map(p => [p.id, p]));
+  const total = allPockets.reduce((s, p) => s + p.balance_idr, 0);
+  $('sum-total').textContent = num(total);
+  $('sum-pockets').textContent = allPockets.length + ' dompet';
+  const ul = $('pockets');
+  if (!allPockets.length) return empty(ul, 'belum ada dompet');
+  ul.innerHTML = allPockets.map(p => `
+    <li><div class="top">
+      <span class="name">${esc(p.name)}</span>
+      <span class="amt ${p.balance_idr < 0 ? 'out' : ''}">${num(p.balance_idr)}</span>
+    </div><div class="meta"><span class="pill">${esc(p.type)}</span><span class="pill">#${p.id}</span></div></li>`).join('');
+}
+
+async function loadSummary() {
+  const period = $('period').value;
+  const s = await api('/api/summary?period=' + encodeURIComponent(period));
+  $('sum-out').textContent = num(s.total_out_idr);
+  $('sum-in').textContent = num(s.total_in_idr);
+  $('sum-period').textContent = s.month ? 'bulan ' + s.month : s.from + ' → ' + s.to;
+  const cats = (s.by_category || []).filter(c => c.direction === 'out');
+  const max = Math.max(1, ...cats.map(c => c.total_idr));
+  const ul = $('cats');
+  if (!cats.length) return empty(ul, 'tidak ada pengeluaran di periode ini');
+  ul.innerHTML = cats.map(c => `
+    <li><div class="top"><span class="name">${esc(c.category)}</span>
+      <span class="amt out">${num(c.total_idr)}</span></div>
+      <div class="bar"><i style="width:${Math.round(c.total_idr / max * 100)}%"></i></div></li>`).join('');
+}
+
+async function loadTxns() {
+  const ul = $('txns');
+  try {
+    const rows = await api('/api/txns?period=' + encodeURIComponent($('txn-period').value) + '&limit=200');
+    if (!rows.length) return empty(ul, 'tidak ada transaksi');
+    ul.innerHTML = rows.map(t => `
+      <li><div class="top">
+        <span class="name">${esc(t.note || t.category)}</span>
+        <span class="amt ${t.direction}">${t.direction === 'out' ? '-' : '+'}${num(t.amount_idr)}</span>
+      </div><div class="meta">${esc(t.created_at.slice(0, 16).replace('T', ' '))}
+        · <span class="pill">${esc(t.category)}</span><span class="pill">${esc(t.pocket)}</span></div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
+async function loadNotes() {
+  const ul = $('notes-list');
+  const q = $('note-q').value.trim(), tag = $('note-tag').value.trim();
+  try {
+    let url = '/api/notes';
+    if (q) url += '?q=' + encodeURIComponent(q); else if (tag) url += '?tag=' + encodeURIComponent(tag);
+    const rows = await api(url);
+    if (!rows.length) return empty(ul, q || tag ? 'tidak ada yang cocok' : 'belum ada note');
+    ul.innerHTML = rows.map(n => `
+      <li class="click" data-note="${n.id}"><div class="top">
+        <span class="name">${esc(n.title)}</span>
+        <span class="meta">${esc((n.updated_at || '').slice(0, 10))}</span>
+      </div><div class="meta">${(n.tags || []).map(t => '<span class="pill">' + esc(t) + '</span>').join('')}</div>
+      <div class="body" hidden></div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
+async function loadMeals() {
+  const day = $('meal-day').value || new Date().toISOString().slice(0, 10);
+  const ul = $('meals-list');
+  try {
+    const [roll, meals] = await Promise.all([
+      api('/api/day?day=' + day), api('/api/meals?day=' + day),
+    ]);
+    $('macro-cal').textContent = roll.calories + ' kcal';
+    $('macro-target').textContent = roll.calorie_target ? 'target ' + roll.calorie_target + ' kcal' : 'target belum diset';
+    $('macro-pcf').textContent = roll.protein_g + ' / ' + roll.carbs_g + ' / ' + roll.fat_g;
+    if (!meals.length) return empty(ul, 'belum ada catatan makan hari ini');
+    ul.innerHTML = meals.map(m => {
+      const cal = m.items.reduce((s, i) => s + (i.calories || 0), 0);
+      const est = m.source === 'photo' ? '<span class="pill">estimasi</span>' : '';
+      return `<li><div class="top"><span class="name">${esc(m.note || m.source)}</span>
+        <span class="amt">${cal} kcal</span></div>
+        <div class="meta">${est}<span class="pill">${esc(m.logged_at)}</span></div>
+        <div class="body">${m.items.map(i =>
+          esc(i.name) + ' — ' + i.calories + ' kcal (P' + i.protein_g + ' C' + i.carbs_g + ' F' + i.fat_g + ')'
+        ).join('\n')}</div></li>`;
+    }).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tabs button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === name));
+  document.querySelectorAll('main section').forEach(s => s.classList.toggle('active', s.id === name));
+  if (name === 'ringkasan') { loadSummary(); loadPockets(); }
+  if (name === 'transaksi') loadTxns();
+  if (name === 'notes') loadNotes();
+  if (name === 'meals') loadMeals();
+}
+
+document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
+$('refresh').addEventListener('click', () => { loadSummary(); loadPockets(); });
+$('txn-refresh').addEventListener('click', loadTxns);
+$('note-refresh').addEventListener('click', loadNotes);
+$('note-q').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });
+$('note-tag').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });
+$('meal-refresh').addEventListener('click', loadMeals);
+$('meal-day').addEventListener('change', loadMeals);
+$('txn-period').addEventListener('change', loadTxns);
+
+$('notes-list').addEventListener('click', async (e) => {
+  const li = e.target.closest('li[data-note]');
+  if (!li) return;
+  const body = li.querySelector('.body');
+  if (!body.hidden) { body.hidden = true; return; }
+  if (!body.textContent) {
+    try { const n = await api('/api/notes/' + li.dataset.note); body.textContent = n.body_md || '(kosong)'; }
+    catch (err) { body.textContent = 'gagal memuat: ' + err.message; }
+  }
+  body.hidden = false;
+});
+
+$('meal-day').value = new Date().toLocaleDateString('sv-SE'); // local YYYY-MM-DD
+$('stamp').textContent = 'read-only · ' + new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
+showTab('ringkasan');
+</script>
+</body>
+</html>

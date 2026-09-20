@@ -99,9 +99,43 @@ The agent drives all of this through
 household fix (rename a pocket, retype eCard, delete a wrong entry, add a family
 member, reset test data) has an endpoint.
 
+## Tests
+
+`go test ./...` covers every endpoint in the route table and fails if one is
+never exercised (`service/cover_test.go` is a coverage gate, not a percentage
+target). The suite runs against a real Postgres so the SQL, constraints and
+balance maths are exercised for real:
+
+```
+sudo -u postgres psql -c "CREATE DATABASE inem_test OWNER inem"
+sudo -u postgres psql -d inem_test -c "CREATE EXTENSION IF NOT EXISTS vector"
+cd service && go test ./... -cover
+```
+
+`INEM_TEST_DSN` overrides the default `postgres://inem@127.0.0.1:5432/inem_test`;
+if the database is unreachable the DB-backed tests skip instead of failing.
+The suite truncates its tables between tests and never touches the `inem`
+database. It also guards the bugs found while writing it: a `tags`-less note
+POST used to violate NOT NULL, and a reset used to rewind a table's id sequence
+while other members still had rows (colliding ids on the next INSERT).
+
+## Read-only dashboard (inemdash)
+
+`service/dashboard` serves one static page + a GET-only JSON passthrough to
+inemd: ringkasan (period totals, category bars, pocket balances), transaksi,
+notes with search/tag filter, and meals with macros + daily target.
+
+- No write path exists in the binary — only GET routes are registered, so every
+  POST/PATCH/DELETE answers 405 and never reaches inemd.
+- `INEM_WEB_ADDR` (default `127.0.0.1:8090`), `INEM_WEB_USER` (internal user id),
+  `INEM_WEB_AUTH_PASS` (HTTP basic auth; unset = no auth, so only bind localhost
+  or put TLS+auth in front). Deployed as `deploy/inemdash.service` with
+  `/etc/inem-dash.env`; nginx proxies `https://danimunf.duckdns.org/inem/` to it.
+
 ## Deployment notes
 
-- Binds to localhost only; never exposed.
+- inemd binds to localhost only; never exposed directly. The dashboard is the
+  only off-box surface and it is read-only + basic auth over TLS.
 - Postgres is local-only with `trust` auth on `127.0.0.1` (see
   `docs/DECISIONS.md` for why: SCRAM handshake failed on this box while the
   stored verifier matched — a local-only trust line was the pragmatic fix).
@@ -109,5 +143,6 @@ member, reset test data) has an endpoint.
 
 ## Status
 
-Phase 0 — schema, identity, domain service skeleton. Endpoints are live and
-being verified. Next: systemd unit, then wiring the Hermes side.
+Phase 0 — schema, identity, domain services, full REST surface (CRUD + admin),
+test suite with a route-coverage gate, read-only dashboard behind nginx. Next:
+the Hermes side in daily use, then voice/OCR input.

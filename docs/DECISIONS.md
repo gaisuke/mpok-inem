@@ -67,3 +67,24 @@ in the DB.
 `users(id, telegram_user_id, display_name)` in `inem_auth` schema from day
 one; every domain table carries `user_id`. Adding Dani's wife = one INSERT +
 one Telegram allowlist entry.
+
+## D4 — Dashboard is a separate, GET-only binary; tests run against a real Postgres (2026-09-20)
+
+Two calls made after the CRUD/admin surface landed:
+
+- **`inemdash` (service/dashboard) instead of a UI inside inemd.** D1 keeps the
+  Go services as thin deterministic domain APIs; a browser UI in the same binary
+  would need its own auth model (browsers can't send `X-User-ID`) and would put
+  a write path next to a read-only page. The dashboard registers *only* GET
+  routes and proxies to inemd with a fixed internal user id, so it is
+  structurally incapable of writing: any POST/PATCH/DELETE answers 405 before
+  reaching inemd. It binds 127.0.0.1 and nginx terminates TLS + proxies
+  `/inem/`; basic auth lives in the dashboard env, not in nginx.
+- **Tests hit a real Postgres (`inem_test`), not mocks.** Balance Maths lives in
+  `balanceSQL`, and constraints (NOT NULL tags, pocket name uniqueness, FK
+  cascade on meal_items, note_links without cascade) are part of the contract;
+  a mock would let the schema and the service drift apart. `cover_test.go` is a
+  coverage *gate*: it fails the build if any route in `allRoutes()` was never
+  exercised, so a new endpoint cannot ship untested. Writing the suite found two
+  real bugs: a tags-less note POST violated NOT NULL, and `scope=all` reset
+  rewound id sequences while another member still had rows (colliding ids).
