@@ -133,7 +133,7 @@ func TestDataEndpointsRequireIdentity(t *testing.T) {
 	f, g := &fakeInemd{}, &fakeGate{}
 	h := dash(t, f, g).handler()
 
-	for _, path := range []string{"/api/pockets", "/api/summary", "/api/txns", "/api/transfers", "/api/notes", "/api/meals", "/api/day", "/api/target", "/api/pocket?id=1"} {
+	for _, path := range []string{"/api/pockets", "/api/summary", "/api/txns", "/api/transfers", "/api/schedules", "/api/notes", "/api/meals", "/api/day", "/api/target", "/api/pocket?id=1"} {
 		code, body := get(t, h, path, "")
 		if code != 401 || !strings.Contains(body, "not authenticated") {
 			t.Fatalf("%s without a session: %d %s", path, code, body)
@@ -314,6 +314,7 @@ func TestPassthroughPathsAndHeader(t *testing.T) {
 		{"/api/notes?q=wifi%20bill", "/v1/notes/search", "q=wifi%20bill"},
 		{"/api/notes/12", "/v1/notes/12", ""},
 		{"/api/household", "/v1/household", ""},
+		{"/api/schedules", "/v1/schedules", ""},
 		{"/api/meals?day=2026-09-01", "/v1/meals", "day=2026-09-01"},
 		{"/api/day", "/v1/nutrition/daily", "day=" + time.Now().Format("2006-01-02")},
 		{"/api/target", "/v1/nutrition/target", "day=" + time.Now().Format("2006-01-02")},

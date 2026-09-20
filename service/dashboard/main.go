@@ -74,6 +74,7 @@ func (s *server) handler() http.Handler {
 		return q + "&limit=" + limitOr(r, "100", "500"), nil
 	})))
 	mux.HandleFunc("GET /api/household", s.authed(s.pass("/v1/household", nil)))
+	mux.HandleFunc("GET /api/schedules", s.authed(s.pass("/v1/schedules", nil)))
 	mux.HandleFunc("GET /api/notes", s.authed(s.proxyNotes))
 	mux.HandleFunc("GET /api/notes/{id}", s.authed(s.pass("/v1/notes/{id}", nil)))
 	mux.HandleFunc("GET /api/meals", s.authed(s.pass("/v1/meals", func(r *http.Request) (string, error) {

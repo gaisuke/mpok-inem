@@ -82,6 +82,7 @@
     <button data-tab="ringkasan" aria-selected="true">Ringkasan</button>
     <button data-tab="transaksi">Transaksi</button>
     <button data-tab="rumah">Rumah tangga</button>
+    <button data-tab="jadwal">Jadwal</button>
     <button data-tab="notes">Notes</button>
     <button data-tab="meals">Meals</button>
   </div>
@@ -163,6 +164,13 @@
     <ul id="txns"></ul>
     <h2>Pindah uang</h2>
     <ul id="transfers"></ul>
+  </section>
+
+  <section id="jadwal">
+    <div class="row">
+      <button class="act" id="jd-refresh">Muat ulang</button>
+    </div>
+    <ul id="schedules"></ul>
   </section>
 
   <section id="notes">
@@ -321,6 +329,29 @@ async function loadTransfers() {
   } catch (e) { fail(ul, e.message); }
 }
 
+// Recurring plans: what the bank is expected to move this month, and whether the
+// ledger already has it. Read-only — the plans are recorded from chat, after Dani
+// confirms the money actually moved.
+async function loadSchedules() {
+  const ul = $('schedules');
+  try {
+    const rows = await api('/api/schedules');
+    if (!rows.length) return empty(ul, 'belum ada transfer terjadwal');
+    const mark = { done: 'sudah dicatat', due_today: 'hari ini', overdue: 'terlambat', upcoming: 'menunggu' };
+    ul.innerHTML = rows.map(s => {
+      const route = s.kind === 'transfer'
+        ? `${esc(s.from)} → ${esc(s.to)}` : `masuk → ${esc(s.to)}`;
+      return `<li><div class="top">
+        <span class="name">${route}</span>
+        <span class="amt">${num(s.amount_idr)}</span>
+      </div><div class="meta">tgl ${s.day_of_month} · ${esc(s.due_date)}
+        · <span class="pill">${esc(mark[s.status] || s.status)}</span>
+        ${s.active ? '' : '<span class="pill">nonaktif</span>'}
+        ${s.note ? ' · ' + esc(s.note) : ''}</div></li>`;
+    }).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
 async function loadNotes() {
   const ul = $('notes-list');
   const q = $('note-q').value.trim(), tag = $('note-tag').value.trim();
@@ -370,6 +401,7 @@ function showTab(name) {
   if (name === 'ringkasan') { loadSummary(); loadPockets(); }
   if (name === 'pocket' && currentPocket) openPocket(currentPocket, $('pd-period').value);
   if (name === 'rumah') loadHousehold();
+  if (name === 'jadwal') loadSchedules();
   if (name === 'transaksi') { loadTxns(); loadTransfers(); }
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
@@ -395,6 +427,7 @@ $('pocket-back').addEventListener('click', () => showTab('ringkasan'));
 $('pd-period').addEventListener('change', () => openPocket(currentPocket, $('pd-period').value));
 $('refresh').addEventListener('click', () => { loadSummary(); loadPockets(); });
 $('txn-refresh').addEventListener('click', () => { loadTxns(); loadTransfers(); });
+$('jd-refresh').addEventListener('click', loadSchedules);
 $('note-refresh').addEventListener('click', loadNotes);
 $('note-q').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });
 $('note-tag').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });

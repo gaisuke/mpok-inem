@@ -759,7 +759,18 @@ func withUserID(next func(w http.ResponseWriter, r *http.Request, uid, id int)) 
 	}
 }
 
-// dateRange validates optional ?from/?to (YYYY-MM-DD); empty means no filter.
+// dateParam reads one optional YYYY-MM-DD query parameter, defaulting to today.
+func dateParam(r *http.Request, name string) (string, string) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return time.Now().Format("2006-01-02"), ""
+	}
+	if _, err := time.Parse("2006-01-02", v); err != nil {
+		return "", name + " must be YYYY-MM-DD"
+	}
+	return v, ""
+}
+
 func dateRange(r *http.Request) (from, to, errMsg string) {
 	q := r.URL.Query()
 	from, to = q.Get("from"), q.Get("to")
@@ -926,17 +937,18 @@ type txn struct {
 	AmountIDR int64  `json:"amount_idr"`
 	Category  string `json:"category"`
 	Note      string `json:"note"`
+	Source    string `json:"source"`
 	CreatedAt string `json:"created_at"`
 }
 
 const txnSelect = `SELECT t.id, t.pocket_id, p.name, t.direction, t.amount, t.category,
-	COALESCE(t.note,''), t.created_at
+	COALESCE(t.note,''), t.source, t.created_at
 	FROM expense.transactions t JOIN expense.pockets p ON p.id=t.pocket_id`
 
 func scanTxn(s interface{ Scan(...any) error }) (txn, error) {
 	var t txn
 	var ts time.Time
-	err := s.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &ts)
+	err := s.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &t.Source, &ts)
 	t.CreatedAt = ts.Format(time.RFC3339)
 	return t, err
 }
@@ -1013,6 +1025,7 @@ func deleteTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
 		notFound(w, "transaction not found")
 		return
 	}
+	// a booked entry un-books its month through the foreign key (see deleteTransfer)
 	writeJSON(w, 200, map[string]any{"deleted": n})
 }
 
@@ -1128,7 +1141,402 @@ func deleteTransfer(w http.ResponseWriter, r *http.Request, userID, id int) {
 		notFound(w, "transfer not found")
 		return
 	}
+	// Deleting a booked entry un-books its month through the foreign key
+	// (ON DELETE CASCADE), so a mistaken entry does not leave the plan stuck on
+	// "already booked" with nothing to show for it.
 	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+// ---------- expense: schedules (recurring plans) ----------
+//
+// A schedule is a promise about the future, not a record of the past: the bank or
+// the payroll system does the moving, and the ledger only books it once a human
+// confirms it happened. Nothing here writes to the ledger by itself — running a
+// schedule creates an ordinary transfer (or income entry) through the same code
+// path as a manual one, so the balance maths has exactly one implementation.
+
+type schedule struct {
+	ID         int64  `json:"id"`
+	Kind       string `json:"kind"`
+	FromPocket *int   `json:"from_pocket_id"`
+	From       string `json:"from"`
+	ToPocket   int    `json:"to_pocket_id"`
+	To         string `json:"to"`
+	AmountIDR  int64  `json:"amount_idr"`
+	DayOfMonth int    `json:"day_of_month"`
+	Note       string `json:"note"`
+	Active     bool   `json:"active"`
+	Period     string `json:"period"`
+	DueDate    string `json:"due_date"`
+	Status     string `json:"status"`
+}
+
+// scheduleSQL computes, for one date, when each plan lands this month and whether
+// it has already been booked. A day the month does not have (the 31st in April)
+// falls back to the last day of that month instead of being skipped.
+const scheduleSQL = `
+WITH base AS (
+  SELECT s.*, LEAST(s.day_of_month,
+    EXTRACT(DAY FROM (date_trunc('month',$2::date) + interval '1 month - 1 day'))::int) AS eff_day
+  FROM expense.schedules s WHERE s.user_id=$1
+), dated AS (
+  SELECT b.*, (date_trunc('month',$2::date)::date + (b.eff_day - 1)) AS due_date
+  FROM base b
+)
+SELECT d.id, d.kind, d.from_pocket, COALESCE(pf.name,''), d.to_pocket, pt.name,
+  d.amount, d.day_of_month, COALESCE(d.note,''), d.active,
+  to_char($2::date,'YYYY-MM'), d.due_date::text,
+  CASE WHEN r.id IS NOT NULL THEN 'done'
+       WHEN d.due_date = $2::date THEN 'due_today'
+       WHEN d.due_date < $2::date THEN 'overdue'
+       ELSE 'upcoming' END
+FROM dated d
+JOIN expense.pockets pt ON pt.id=d.to_pocket
+LEFT JOIN expense.pockets pf ON pf.id=d.from_pocket
+LEFT JOIN expense.schedule_runs r ON r.schedule_id=d.id AND r.period=to_char($2::date,'YYYY-MM')
+WHERE ($3::bool IS NOT TRUE)
+   OR (d.active AND r.id IS NULL AND d.due_date <= $2::date)
+ORDER BY d.eff_day, d.id`
+
+func scanSchedules(rows *sql.Rows) ([]schedule, error) {
+	out := []schedule{}
+	for rows.Next() {
+		var s schedule
+		var from *int
+		if err := rows.Scan(&s.ID, &s.Kind, &from, &s.From, &s.ToPocket, &s.To,
+			&s.AmountIDR, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate, &s.Status); err != nil {
+			return nil, err
+		}
+		s.FromPocket = from
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// listSchedules: my plans, each with the date it lands this month and its status.
+// ?pending=true narrows it to the ones that still need a confirmation (due today
+// or already overdue) — that is what the reminder and the chat flow ask about.
+func listSchedules(w http.ResponseWriter, r *http.Request, userID int) {
+	day, msg := dateParam(r, "date")
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	pending := r.URL.Query().Get("pending") == "true"
+	rows, err := db.Query(scheduleSQL, userID, day, pending)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	out, err := scanSchedules(rows)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Kind       string `json:"kind"`
+		From       int    `json:"from_pocket_id"`
+		To         int    `json:"to_pocket_id"`
+		Amount     int64  `json:"amount_idr"`
+		DayOfMonth int    `json:"day_of_month"`
+		Note       string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Kind == "" {
+		in.Kind = "transfer"
+	}
+	if in.Kind != "transfer" && in.Kind != "income" {
+		badReq(w, "kind must be transfer|income")
+		return
+	}
+	if in.Amount <= 0 {
+		badReq(w, "amount_idr must be > 0")
+		return
+	}
+	if in.DayOfMonth < 1 || in.DayOfMonth > 31 {
+		badReq(w, "day_of_month must be 1..31")
+		return
+	}
+	if in.To == 0 {
+		badReq(w, "to_pocket_id required")
+		return
+	}
+	if in.Kind == "transfer" {
+		if in.From == 0 || in.From == in.To {
+			badReq(w, "from_pocket_id required and must differ from the destination")
+			return
+		}
+	}
+	// both ends must be the caller's own pockets: a plan spends the planner's money
+	for _, pid := range []int{in.From, in.To} {
+		if pid == 0 {
+			continue
+		}
+		var own int
+		if err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, pid, userID).Scan(&own); err != nil {
+			badReq(w, "pocket not found for user")
+			return
+		}
+	}
+	var from any
+	if in.Kind == "transfer" {
+		from = in.From
+	}
+	var id int64
+	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note)
+		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+		userID, in.Kind, from, in.To, in.Amount, in.DayOfMonth, in.Note).Scan(&id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": id})
+}
+
+func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var in struct {
+		Amount     *int64  `json:"amount_idr"`
+		DayOfMonth *int    `json:"day_of_month"`
+		Note       *string `json:"note"`
+		Active     *bool   `json:"active"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	sets := []string{}
+	args := []any{userID, id}
+	if in.Amount != nil {
+		if *in.Amount <= 0 {
+			badReq(w, "amount_idr must be > 0")
+			return
+		}
+		args = append(args, *in.Amount)
+		sets = append(sets, fmt.Sprintf("amount=$%d", len(args)))
+	}
+	if in.DayOfMonth != nil {
+		if *in.DayOfMonth < 1 || *in.DayOfMonth > 31 {
+			badReq(w, "day_of_month must be 1..31")
+			return
+		}
+		args = append(args, *in.DayOfMonth)
+		sets = append(sets, fmt.Sprintf("day_of_month=$%d", len(args)))
+	}
+	if in.Note != nil {
+		args = append(args, *in.Note)
+		sets = append(sets, fmt.Sprintf("note=$%d", len(args)))
+	}
+	if in.Active != nil {
+		args = append(args, *in.Active)
+		sets = append(sets, fmt.Sprintf("active=$%d", len(args)))
+	}
+	if len(sets) == 0 {
+		badReq(w, "nothing to update: send amount_idr, day_of_month, note or active")
+		return
+	}
+	res, err := db.Exec(`UPDATE expense.schedules SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		notFound(w, "schedule not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"updated": 1})
+}
+
+func deleteSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
+	if !confirmOK(r) {
+		badReq(w, "confirm=true required")
+		return
+	}
+	res, err := db.Exec(`DELETE FROM expense.schedules WHERE user_id=$1 AND id=$2`, userID, id)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		notFound(w, "schedule not found")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+// runSchedules books the plans that were confirmed. Body:
+// {"date":"YYYY-MM-DD","ids":[...],"force":false}. Without ids it books every
+// plan that is due (or overdue) on that date. One schedule can only be booked
+// once per month — that is the guard against double-counting a recurring plan,
+// and it lives in the database (unique on schedule_id+period), not in the caller.
+func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Date      string `json:"date"`
+		EntryDate string `json:"entry_date"`
+		IDs       []int  `json:"ids"`
+		Force     bool   `json:"force"`
+		MarkOnly  bool   `json:"mark_only"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Date == "" {
+		in.Date = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", in.Date); err != nil {
+		badReq(w, "date must be YYYY-MM-DD")
+		return
+	}
+	if in.Date > time.Now().Format("2006-01-02") {
+		badReq(w, "date must not be in the future: the money has not moved yet")
+		return
+	}
+	// The entry is dated the day the money moved (the plan's own date), not the
+	// day it was confirmed — confirming on the 3rd still books the 1st.
+	if in.EntryDate != "" {
+		if _, err := time.Parse("2006-01-02", in.EntryDate); err != nil {
+			badReq(w, "entry_date must be YYYY-MM-DD")
+			return
+		}
+		if in.EntryDate > time.Now().Format("2006-01-02") {
+			badReq(w, "entry_date must not be in the future")
+			return
+		}
+	}
+	rows, err := db.Query(scheduleSQL, userID, in.Date, false)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	all, err := scanSchedules(rows)
+	rows.Close()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	want := map[int]bool{}
+	for _, id := range in.IDs {
+		want[id] = true
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer tx.Rollback()
+	ran, skipped := []map[string]any{}, []map[string]any{}
+	for _, s := range all {
+		if len(want) > 0 && !want[int(s.ID)] {
+			continue
+		}
+		if !s.Active {
+			skipped = append(skipped, map[string]any{"schedule_id": s.ID, "reason": "not active"})
+			continue
+		}
+		if len(want) == 0 && s.Status != "due_today" && s.Status != "overdue" {
+			continue
+		}
+		if s.Status == "done" && !in.Force {
+			skipped = append(skipped, map[string]any{"schedule_id": s.ID, "reason": "already booked for " + s.Period})
+			continue
+		}
+		// mark_only records that this month is settled without adding an entry —
+		// for a month that was already part of a pocket's opening balance, so the
+		// plan stops asking about a transfer the ledger never had to see.
+		if in.MarkOnly {
+			if _, err := tx.Exec(`INSERT INTO expense.schedule_runs(schedule_id,period) VALUES($1,$2)
+				ON CONFLICT (schedule_id,period) DO NOTHING`, s.ID, s.Period); err != nil {
+				badReq(w, err.Error())
+				return
+			}
+			skipped = append(skipped, map[string]any{"schedule_id": s.ID,
+				"reason": "ditandai sudah beres untuk " + s.Period + " (tanpa entri)"})
+			continue
+		}
+		note := s.Note
+		entryDate := s.DueDate
+		if in.EntryDate != "" {
+			entryDate = in.EntryDate
+		}
+		var transferID, txnID any
+		if s.Kind == "income" {
+			var id int64
+			err = tx.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,created_at)
+				VALUES($1,$2,'in',$3,'gaji',$4,'scheduled',$5::date) RETURNING id`,
+				userID, s.ToPocket, s.AmountIDR, note, entryDate).Scan(&id)
+			txnID = id
+		} else {
+			var id int64
+			err = tx.QueryRow(`INSERT INTO expense.transfers(user_id,from_pocket,to_pocket,amount,note,created_at)
+				VALUES($1,$2,$3,$4,$5,$6::date) RETURNING id`,
+				userID, *s.FromPocket, s.ToPocket, s.AmountIDR, note, entryDate).Scan(&id)
+			transferID = id
+		}
+		if err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		if _, err := tx.Exec(`INSERT INTO expense.schedule_runs(schedule_id,period,transfer_id,txn_id)
+			VALUES($1,$2,$3,$4) ON CONFLICT (schedule_id,period) DO UPDATE
+			SET transfer_id=EXCLUDED.transfer_id, txn_id=EXCLUDED.txn_id`, s.ID, s.Period, transferID, txnID); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		entry := map[string]any{"schedule_id": s.ID, "kind": s.Kind, "amount_idr": s.AmountIDR,
+			"from": s.From, "to": s.To, "due_date": s.DueDate, "period": s.Period,
+			"entry_date": entryDate}
+		if transferID != nil {
+			entry["transfer_id"] = transferID
+		}
+		if txnID != nil {
+			entry["txn_id"] = txnID
+		}
+		ran = append(ran, entry)
+	}
+	if err := tx.Commit(); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	// A plan can overdraw its source pocket when the real money did not arrive.
+	// The entry is still recorded (it mirrors reality), but say so plainly.
+	warnings := []string{}
+	for _, pid := range affectedPockets(ran, all) {
+		var name string
+		var bal int64
+		if err := db.QueryRow(`SELECT p.name, `+balanceExpr+` FROM expense.pockets p WHERE p.id=$1`, pid).Scan(&name, &bal); err != nil {
+			continue
+		}
+		if bal < 0 {
+			warnings = append(warnings, fmt.Sprintf("saldo %s jadi minus (%d) setelah jadwal ini", name, bal))
+		}
+	}
+	writeJSON(w, 200, map[string]any{"date": in.Date, "ran": ran, "skipped": skipped, "warnings": warnings})
+}
+
+// affectedPockets lists the source pockets of the transfers just booked.
+func affectedPockets(ran []map[string]any, all []schedule) []int {
+	out := []int{}
+	for _, e := range ran {
+		if e["kind"] != "transfer" {
+			continue
+		}
+		id := int(e["schedule_id"].(int64))
+		for _, s := range all {
+			if int(s.ID) == id && s.FromPocket != nil {
+				out = append(out, *s.FromPocket)
+			}
+		}
+	}
+	return out
 }
 
 // ---------- expense: admin ----------
@@ -1792,6 +2200,12 @@ func allRoutes() []route {
 
 		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
 		{"GET", "/v1/household", withUser(household)},
+
+		{"GET", "/v1/schedules", withUser(listSchedules)},
+		{"POST", "/v1/schedules", withUser(createSchedule)},
+		{"PATCH", "/v1/schedules/{id}", withUserID(updateSchedule)},
+		{"DELETE", "/v1/schedules/{id}", withUserID(deleteSchedule)},
+		{"POST", "/v1/schedules/run", withUser(runSchedules)},
 
 		{"POST", "/v1/admin/reset", withUser(resetData)},
 		{"GET", "/v1/admin/users", listUsers},

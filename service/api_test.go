@@ -1103,6 +1103,225 @@ func TestMemberScopeAndIdentity(t *testing.T) {
 	}
 }
 
+// Recurring plans: the ledger books them only when a human confirms, once per
+// month, dated the day the money actually moved (not the day it was confirmed).
+func TestSchedulesBookOncePerMonthAndBackdate(t *testing.T) {
+	a := newAPI(t)
+	now := time.Now()
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	third := time.Date(now.Year(), now.Month(), 3, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	period := now.Format("2006-01")
+
+	main := a.pocket("Jago Utama", "cash", 5000000)
+	saving := a.pocket("Tabungan Jago", "savings", 20000000)
+	salary := a.pocket("BRImo", "cash", 0)
+
+	// the plan: 1jt into savings on the 1st, salary arriving on the 1st
+	sav := a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": saving, "amount_idr": 1000000,
+		"day_of_month": 1, "note": "tabungan bulanan"}, 201)
+	savID := int(sav["id"].(float64))
+	sal := a.obj("POST", "/v1/schedules", map[string]any{
+		"kind": "income", "to_pocket_id": salary, "amount_idr": 8000000,
+		"day_of_month": 1, "note": "gaji"}, 201)
+	salID := int(sal["id"].(float64))
+
+	// shape guards
+	a.want("POST", "/v1/schedules", map[string]any{
+		"to_pocket_id": saving, "amount_idr": 1000, "day_of_month": 1}, 400) // no source for a transfer
+	a.want("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": main, "amount_idr": 1000, "day_of_month": 1}, 400)
+	a.want("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": saving, "amount_idr": 0, "day_of_month": 1}, 400)
+	a.want("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": saving, "amount_idr": 1000, "day_of_month": 32}, 400)
+	a.want("POST", "/v1/schedules", map[string]any{
+		"kind": "charity", "to_pocket_id": saving, "amount_idr": 1000, "day_of_month": 1}, 400)
+	a.want("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": 999999, "to_pocket_id": saving, "amount_idr": 1000, "day_of_month": 1}, 400)
+
+	// on the 1st both are due and nothing is booked yet
+	due := a.list("GET", "/v1/schedules?date="+first, 200)
+	if len(due) != 2 {
+		t.Fatalf("plans: %v", due)
+	}
+	for _, d := range due {
+		if d.(map[string]any)["status"] != "due_today" || d.(map[string]any)["due_date"] != first {
+			t.Fatalf("status on the 1st: %v", d)
+		}
+	}
+	// a day the month does not have falls back to the last day instead of vanishing
+	clamp := a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": saving, "amount_idr": 250000,
+		"day_of_month": 31, "note": "akhir bulan"}, 201)
+	clampID := int(clamp["id"].(float64))
+	byID := func(date string) map[string]any {
+		for _, s := range a.list("GET", "/v1/schedules?date="+date, 200) {
+			if int(s.(map[string]any)["id"].(float64)) == clampID {
+				return s.(map[string]any)
+			}
+		}
+		t.Fatalf("schedule %d missing for %s", clampID, date)
+		return nil
+	}
+	if got := byID("2026-02-15")["due_date"]; got != "2026-02-28" {
+		t.Fatalf("day 31 in February should land on the 28th, got %v", got)
+	}
+	if got := byID("2026-04-15")["due_date"]; got != "2026-04-30" {
+		t.Fatalf("day 31 in April should land on the 30th, got %v", got)
+	}
+	if got := byID("2026-01-15")["due_date"]; got != "2026-01-31" {
+		t.Fatalf("day 31 in January stays the 31st, got %v", got)
+	}
+	a.want("DELETE", fmt.Sprintf("/v1/schedules/%d?confirm=true", clampID), nil, 200)
+
+	// confirming on the 3rd still books the money on the 1st
+	run := a.obj("POST", "/v1/schedules/run", map[string]any{"date": third}, 200)
+	ran := run["ran"].([]any)
+	if len(ran) != 2 {
+		t.Fatalf("should have booked both plans: %v", run)
+	}
+	if got := a.balanceOf(a.uid, saving); got != 21000000 {
+		t.Fatalf("savings after the plan: %d", got)
+	}
+	if got := a.balanceOf(a.uid, main); got != 4000000 {
+		t.Fatalf("main pocket after the plan: %d", got)
+	}
+	if got := a.balanceOf(a.uid, salary); got != 8000000 {
+		t.Fatalf("salary pocket after the plan: %d", got)
+	}
+	tr := a.list("GET", "/v1/transfers?month="+period, 200)
+	if len(tr) != 1 || tr[0].(map[string]any)["created_at"].(string)[:10] != first {
+		t.Fatalf("the transfer should be dated the 1st: %v", tr)
+	}
+	txns := a.list("GET", "/v1/transactions?month="+period, 200)
+	if len(txns) != 1 {
+		t.Fatalf("income entries: %v", txns)
+	}
+	income := txns[0].(map[string]any)
+	if income["direction"] != "in" || income["source"] != "scheduled" ||
+		income["created_at"].(string)[:10] != first || int64(income["amount_idr"].(float64)) != 8000000 {
+		t.Fatalf("scheduled income entry: %v", income)
+	}
+
+	// nothing is pending any more, and a second run books nothing
+	if got := len(a.list("GET", "/v1/schedules?date="+third+"&pending=true", 200)); got != 0 {
+		t.Fatalf("nothing should be pending after booking, got %d", got)
+	}
+	again := a.obj("POST", "/v1/schedules/run", map[string]any{"date": third}, 200)
+	if len(again["ran"].([]any)) != 0 {
+		t.Fatalf("a recurring plan must not book twice in one month: %v", again)
+	}
+	if got := a.balanceOf(a.uid, saving); got != 21000000 {
+		t.Fatalf("balance moved on the second run: %d", got)
+	}
+	// the same plan next month is a new period, so it books again
+	nextMonth := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, now.Location())
+	if nextMonth.After(now) {
+		t.Logf("next period (%s) is in the future, skipping its run", nextMonth.Format("2006-01"))
+	}
+
+	// an explicit id books that one plan, and force re-books a period on purpose
+	a.want("POST", "/v1/schedules/run", map[string]any{"date": third, "ids": []int{savID}}, 200)
+	forced := a.obj("POST", "/v1/schedules/run", map[string]any{"date": third, "ids": []int{savID}, "force": true}, 200)
+	if len(forced["ran"].([]any)) != 1 {
+		t.Fatalf("force should re-book: %v", forced)
+	}
+
+	// a plan cannot be booked for a date that has not happened yet
+	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
+	a.want("POST", "/v1/schedules/run", map[string]any{"date": tomorrow}, 400)
+	a.want("POST", "/v1/schedules/run", map[string]any{"date": "not-a-date"}, 400)
+	a.want("GET", "/v1/schedules?date=nope", nil, 400)
+
+	// editing the plan: amount, day, and pausing it
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{"amount_idr": 1200000}, 200)
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{"day_of_month": 5}, 200)
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{"active": false}, 200)
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{"amount_idr": 0}, 400)
+	a.want("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{}, 400)
+	a.want("PATCH", "/v1/schedules/999999", map[string]any{"amount_idr": 1000}, 404)
+
+	// another member neither sees nor runs my plans
+	pipit := mkUser(t, a.conn, 2, "Pipit")
+	if got := len(a.reqList("GET", "/v1/schedules", pipit)); got != 0 {
+		t.Fatalf("her schedule list should be empty, got %d", got)
+	}
+	if code, _ := a.req("POST", "/v1/schedules/run", map[string]any{"ids": []int{salID}}, pipit, true); code != 200 {
+		t.Fatalf("running someone else's schedule id: %d", code)
+	}
+	if got := a.balanceOf(a.uid, salary); got != 8000000 {
+		t.Fatalf("her run must not touch my pockets: %d", got)
+	}
+	if code, _ := a.req("PATCH", fmt.Sprintf("/v1/schedules/%d", savID), map[string]any{"amount_idr": 5}, pipit, true); code != 404 {
+		t.Fatalf("she must not edit my plan: %d", code)
+	}
+	if code, _ := a.req("DELETE", fmt.Sprintf("/v1/schedules/%d?confirm=true", savID), nil, pipit, true); code != 404 {
+		t.Fatalf("she must not delete my plan: %d", code)
+	}
+
+	// delete needs confirmation and is scoped to the owner
+	a.want("DELETE", fmt.Sprintf("/v1/schedules/%d", savID), nil, 400)
+	a.want("DELETE", fmt.Sprintf("/v1/schedules/%d?confirm=true", savID), nil, 200)
+	a.want("DELETE", fmt.Sprintf("/v1/schedules/%d?confirm=true", savID), nil, 404)
+}
+
+// Deleting the entry a plan booked must un-book that month: otherwise a mistaken
+// entry leaves the plan stuck on "already booked" with nothing to show for it.
+func TestDeletingABookedEntryReopensTheMonth(t *testing.T) {
+	a := newAPI(t)
+	now := time.Now()
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+
+	main := a.pocket("Jago Utama", "cash", 3000000)
+	saving := a.pocket("Tabungan Jago", "savings", 0)
+	a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": main, "to_pocket_id": saving, "amount_idr": 1000000,
+		"day_of_month": 1, "note": "tabungan bulanan"}, 201)
+
+	run := a.obj("POST", "/v1/schedules/run", map[string]any{"date": first}, 200)
+	transferID := int(run["ran"].([]any)[0].(map[string]any)["transfer_id"].(float64))
+	if got := len(a.list("GET", "/v1/schedules?date="+first+"&pending=true", 200)); got != 0 {
+		t.Fatalf("booked month should not be pending: %d", got)
+	}
+
+	a.want("DELETE", fmt.Sprintf("/v1/transfers/%d?confirm=true", transferID), nil, 200)
+	if got := len(a.list("GET", "/v1/schedules?date="+first+"&pending=true", 200)); got != 1 {
+		t.Fatalf("deleting the entry should reopen the month, pending=%d", got)
+	}
+	// and it can be booked again, exactly once
+	again := a.obj("POST", "/v1/schedules/run", map[string]any{"date": first}, 200)
+	if len(again["ran"].([]any)) != 1 {
+		t.Fatalf("re-booking after the delete: %v", again)
+	}
+	if got := a.balanceOf(a.uid, saving); got != 1000000 {
+		t.Fatalf("savings should hold exactly one month's plan: %d", got)
+	}
+}
+
+// A plan whose money never arrived must not silently overdraw a pocket: the entry
+// is recorded (it mirrors reality) and the response says so.
+func TestScheduleWarnsWhenTheSourceGoesNegative(t *testing.T) {
+	a := newAPI(t)
+	now := time.Now()
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+
+	small := a.pocket("Cash", "cash", 50000)
+	saving := a.pocket("Tabungan Jago", "savings", 0)
+	a.obj("POST", "/v1/schedules", map[string]any{
+		"from_pocket_id": small, "to_pocket_id": saving, "amount_idr": 200000,
+		"day_of_month": 1, "note": "setoran"}, 201)
+
+	out := a.obj("POST", "/v1/schedules/run", map[string]any{"date": first}, 200)
+	warnings := out["warnings"].([]any)
+	if len(warnings) != 1 || !bodyContains([]byte(fmt.Sprint(warnings[0])), "minus") {
+		t.Fatalf("overdrawing plan should warn: %v", out)
+	}
+	if got := a.balanceOf(a.uid, small); got != -150000 {
+		t.Fatalf("the entry still mirrors reality: %d", got)
+	}
+}
+
 func TestAuthHeaderAndCrossUserIsolation(t *testing.T) {
 	a := newAPI(t)
 	other := mkUser(t, a.conn, 2, "Istri")

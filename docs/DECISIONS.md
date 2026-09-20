@@ -133,6 +133,34 @@ explicitly. The rules that keep this from leaking:
 - `GET /v1/transactions?pocket_id=` scopes by pocket *after* the access check
   rather than by `user_id`, because a shared pocket's rows belong to its owner.
 
+## D9 — Recurring plans are reminders, not auto-writes (2026-09-20)
+
+- **The ledger only records what a human confirms.** His bank already moves the
+  money (1jt to Tabungan Jago on the 1st, 100rb each to Kurban/Umroh/Pulang
+  Kampung on the 2nd, payroll into BRImo on the 1st). A cron that booked those by
+  itself would write down transfers that may never have happened — an autodebit
+  can fail — and the ledger's promise ("the balance matches the bank app") would
+  quietly break. So the plan lives in the ledger, the reminder is a clock, and the
+  entry appears only after he says the money moved.
+- **One code path.** Running a plan creates an ordinary transfer or income entry
+  through the same insert as a manual one, so balance maths has one implementation
+  and a booked plan is indistinguishable from a typed entry except by provenance
+  (`source='scheduled'`, and the run row that points at it).
+- **Booked once per month, enforced by the database** (`UNIQUE(schedule_id,period)`),
+  not by the caller: the failure mode to fear is a recurring plan counted twice.
+  `force` re-books deliberately; deleting the booked entry un-books the month via
+  `ON DELETE CASCADE`, so a mistaken entry never leaves a plan stuck on "already
+  booked" with nothing to show for it.
+- **Dated when the money moved, not when it was confirmed.** Confirming on the 3rd
+  books the 1st (`entry_date` overrides it). A day the month lacks (the 31st in
+  April) falls back to the month's last day rather than being skipped.
+- **`mark_only` exists for history**: a month already inside a pocket's opening
+  balance is marked settled without inventing an entry.
+- **A plan cannot overdraw silently**: if the source pocket would go negative the
+  entry is still recorded (it mirrors reality) and the response says so plainly.
+- **Reminder is deterministic** (no LLM, empty output sends nothing) so it cannot
+  become daily noise, and plans are read-only in the dashboard.
+
 ## D8 — Money moves between members, not just between pockets (2026-09-20)
 
 - **The three cases are one operation.** Cash withdrawal (BRImo → Cash), moving
