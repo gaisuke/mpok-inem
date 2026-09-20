@@ -297,6 +297,7 @@ func TestPassthroughPathsAndHeader(t *testing.T) {
 		{"/api/notes?tag=bills", "/v1/notes", "tag=bills"},
 		{"/api/notes?q=wifi%20bill", "/v1/notes/search", "q=wifi%20bill"},
 		{"/api/notes/12", "/v1/notes/12", ""},
+		{"/api/household", "/v1/household", ""},
 		{"/api/meals?day=2026-09-01", "/v1/meals", "day=2026-09-01"},
 		{"/api/day", "/v1/nutrition/daily", "day=" + time.Now().Format("2006-01-02")},
 		{"/api/target", "/v1/nutrition/target", "day=" + time.Now().Format("2006-01-02")},
@@ -350,7 +351,7 @@ func TestIndexIsServedAndOffline(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("index status %d", code)
 	}
-	for _, needle := range []string{"Mpok Inem", "/api/summary", "/api/notes", "/api/meals", "/api/whoami", "/auth/telegram", "read-only"} {
+	for _, needle := range []string{"Mpok Inem", "/api/summary", "/api/notes", "/api/meals", "/api/whoami", "/auth/telegram", "/api/household", "read-only"} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("index is missing %q", needle)
 		}

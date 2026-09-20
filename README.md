@@ -73,8 +73,9 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | GET | `/healthz` | liveness |
 | POST | `/internal/v1/handle` | uniform entry contract (PRD TRD §4.2) |
 | GET/POST | `/v1/pockets` | list / create pockets |
-| GET | `/v1/pockets/{id}` | one pocket with its balance |
-| PATCH/DELETE | `/v1/pockets/{id}` | rename/retype/reset a pocket; delete an empty one |
+| GET | `/v1/pockets/{id}` | one pocket with its balance (own, or shared with you) |
+| PATCH/DELETE | `/v1/pockets/{id}` | rename/retype/share a pocket; delete an empty one |
+| GET | `/v1/household` | every member's *shared* pockets + household total |
 | POST | `/v1/transactions` | record a transaction |
 | GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `pocket_id`, `limit`) |
 | GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, or drop a mistaken entry |
@@ -99,6 +100,20 @@ The agent drives all of this through
 `~/.hermes/skills/personal/inem/scripts/inem.py` and never opens psql: every
 household fix (rename a pocket, retype eCard, delete a wrong entry, add a family
 member, reset test data) has an endpoint.
+
+### Pocket sharing
+
+A pocket is `private` until its owner shares it (`visibility: shared`). Sharing is
+**read-only**: the other members can open the pocket, its ledger and its moves,
+but every write stays scoped to the owner (`POST /v1/transactions`,
+`PATCH/DELETE /v1/pockets/{id}` → 404 for anyone else).
+
+- A shared pocket's ledger is complete — the balance must still add up — but a
+  counterparty pocket the reader may not see is masked as `(pribadi)` in
+  `GET /v1/transfers`, so a private pocket's name never leaks.
+- `/v1/household` returns only shared pockets, grouped per member, plus the total.
+- Private pockets are invisible in every read path (`404` / `403`), including the
+  household view.
 
 ## Tests
 

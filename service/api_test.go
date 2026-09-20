@@ -182,6 +182,47 @@ func (a *apiTest) list(method, path string, code int) []any {
 	return l
 }
 
+// reqJSON performs an authenticated request as another member and decodes the
+// body as an object.
+func (a *apiTest) reqJSON(method, path string, uid int) map[string]any {
+	a.t.Helper()
+	code, raw := a.req(method, path, nil, uid, true)
+	if code != 200 {
+		a.t.Fatalf("%s %s as user %d: status %d — %s", method, path, uid, code, raw)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		a.t.Fatalf("%s %s: bad json: %v", method, path, err)
+	}
+	return out
+}
+
+func (a *apiTest) reqList(method, path string, uid int) []any {
+	a.t.Helper()
+	code, raw := a.req(method, path, nil, uid, true)
+	if code != 200 {
+		a.t.Fatalf("%s %s as user %d: status %d — %s", method, path, uid, code, raw)
+	}
+	var out []any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		a.t.Fatalf("%s %s: bad json: %v", method, path, err)
+	}
+	return out
+}
+
+func (a *apiTest) reqJSONObj(method, path string, uid int, body any, want int) map[string]any {
+	a.t.Helper()
+	code, raw := a.req(method, path, body, uid, true)
+	if code != want {
+		a.t.Fatalf("%s %s as user %d: status %d, want %d — %s", method, path, uid, code, want, raw)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		a.t.Fatalf("%s %s: bad json: %v", method, path, err)
+	}
+	return out
+}
+
 func (a *apiTest) pocket(name, typ string, opening int64) int {
 	a.t.Helper()
 	out := a.obj("POST", "/v1/pockets",
@@ -774,6 +815,117 @@ func TestResetScopesKeepOtherMembers(t *testing.T) {
 	if otherBalance != 999 {
 		t.Fatalf("other member's pocket changed: %d", otherBalance)
 	}
+}
+
+func TestPocketSharingIsReadOnlyAndOptIn(t *testing.T) {
+	a := newAPI(t)
+	pipit := mkUser(t, a.conn, 2, "Pipit")
+
+	mine := a.pocket("Jago Utama", "cash", 800000)
+	secret := a.pocket("Dana Darurat", "savings", 5000000)
+
+	// private by default: nothing of mine is readable by her
+	if got := a.obj("GET", fmt.Sprintf("/v1/pockets/%d", mine), nil, 200)["visibility"]; got != "private" {
+		t.Fatalf("a new pocket should default to private, got %v", got)
+	}
+	if code, _ := a.req("GET", fmt.Sprintf("/v1/pockets/%d", mine), nil, pipit, true); code != 404 {
+		t.Fatalf("her read of my private pocket: %d", code)
+	}
+	if code, _ := a.req("GET", "/v1/household", nil, pipit, true); code != 200 {
+		t.Fatalf("household: %d", code)
+	}
+	house := a.reqJSON("GET", "/v1/household", pipit)
+	if len(house["members"].([]any)) != 0 {
+		t.Fatalf("nothing is shared yet: %v", house)
+	}
+
+	// share it, and she can read it (and its entries) but never write it
+	upd := a.obj("PATCH", fmt.Sprintf("/v1/pockets/%d", mine), map[string]any{"visibility": "shared"}, 200)
+	if upd["visibility"] != "shared" {
+		t.Fatalf("share did not stick: %v", upd)
+	}
+	a.spend(mine, "out", 25000, "food", "kopi")
+	seen := a.reqJSON("GET", fmt.Sprintf("/v1/pockets/%d", mine), pipit)
+	if seen["name"] != "Jago Utama" || int64(seen["balance_idr"].(float64)) != 775000 {
+		t.Fatalf("shared pocket read: %v", seen)
+	}
+	rows := a.reqList("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d", mine), pipit)
+	if len(rows) != 1 || rows[0].(map[string]any)["note"] != "kopi" {
+		t.Fatalf("shared pocket ledger: %v", rows)
+	}
+
+	house = a.reqJSON("GET", "/v1/household", pipit)
+	members := house["members"].([]any)
+	if len(members) != 1 {
+		t.Fatalf("household should show one member: %v", house)
+	}
+	danis := members[0].(map[string]any)
+	if danis["display_name"] != "Test Dani" || len(danis["pockets"].([]any)) != 1 {
+		t.Fatalf("household member view: %v", danis)
+	}
+	if int64(danis["total_idr"].(float64)) != 775000 {
+		t.Fatalf("household total: %v", danis["total_idr"])
+	}
+
+	// her private pocket stays hidden even from the household view
+	hers := a.reqJSONObj("POST", "/v1/pockets", pipit,
+		map[string]any{"name": "BRImo Pipit", "type": "cash", "opening_balance_idr": 50000}, 201)
+	_ = hers
+	herShared := a.reqJSONObj("POST", "/v1/pockets", pipit,
+		map[string]any{"name": "Seabank", "type": "savings", "opening_balance_idr": 700000, "visibility": "shared"}, 201)
+	_ = herShared
+	mineHouse := a.reqJSON("GET", "/v1/household", a.uid)
+	if len(mineHouse["members"].([]any)) != 2 {
+		t.Fatalf("household should list both members: %v", mineHouse)
+	}
+	if body := fmt.Sprint(mineHouse); bodyContains([]byte(body), "BRImo Pipit") {
+		t.Fatalf("her private pocket leaked into the household view: %s", body)
+	}
+	if !bodyContains([]byte(fmt.Sprint(mineHouse)), "Seabank") {
+		t.Fatalf("her shared pocket is missing: %v", mineHouse)
+	}
+
+	// writes on someone else's shared pocket are refused everywhere
+	if code, _ := a.req("POST", "/v1/transactions", map[string]any{
+		"pocket_id": mine, "direction": "out", "amount_idr": 1000, "category": "food"}, pipit, true); code != 400 {
+		t.Fatalf("she should not be able to spend from my pocket: %d", code)
+	}
+	if code, _ := a.req("PATCH", fmt.Sprintf("/v1/pockets/%d", mine),
+		map[string]any{"name": "Hijacked"}, pipit, true); code != 404 {
+		t.Fatalf("she should not be able to rename my pocket: %d", code)
+	}
+	if code, _ := a.req("PATCH", fmt.Sprintf("/v1/pockets/%d", mine),
+		map[string]any{"visibility": "private"}, pipit, true); code != 404 {
+		t.Fatalf("she should not be able to unshare my pocket: %d", code)
+	}
+	if code, _ := a.req("DELETE", fmt.Sprintf("/v1/pockets/%d?confirm=true", mine), nil, pipit, true); code != 404 {
+		t.Fatalf("she should not be able to delete my pocket: %d", code)
+	}
+	// and a private pocket of mine is invisible in every read path
+	if code, _ := a.req("GET", fmt.Sprintf("/v1/pockets/%d", secret), nil, pipit, true); code != 404 {
+		t.Fatalf("private pocket read: %d", code)
+	}
+	if code, _ := a.req("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d", secret), nil, pipit, true); code != 403 {
+		t.Fatalf("private pocket ledger should be 403: %d", code)
+	}
+	if code, _ := a.req("GET", fmt.Sprintf("/v1/transfers?pocket_id=%d", secret), nil, pipit, true); code != 403 {
+		t.Fatalf("private pocket transfers should be 403: %d", code)
+	}
+	// the owner still sees everything of their own
+	if got := len(a.list("GET", "/v1/pockets", 200)); got != 2 {
+		t.Fatalf("owner pocket list: %d", got)
+	}
+	if len(a.list("GET", fmt.Sprintf("/v1/transactions?pocket_id=%d", secret), 200)) != 0 {
+		t.Fatal("owner should be able to read their own private pocket ledger")
+	}
+
+	// un-sharing takes it back
+	a.obj("PATCH", fmt.Sprintf("/v1/pockets/%d", mine), map[string]any{"visibility": "private"}, 200)
+	if code, _ := a.req("GET", fmt.Sprintf("/v1/pockets/%d", mine), nil, pipit, true); code != 404 {
+		t.Fatalf("un-shared pocket still readable: %d", code)
+	}
+	a.want("PATCH", fmt.Sprintf("/v1/pockets/%d", mine), map[string]any{"visibility": "public"}, 400)
+	a.want("POST", "/v1/pockets", map[string]any{"name": "X", "visibility": "public"}, 400)
 }
 
 func TestAuthHeaderAndCrossUserIsolation(t *testing.T) {

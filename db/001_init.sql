@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS expense.pockets (
   name            text NOT NULL,
   type            text NOT NULL CHECK (type IN ('cash','savings','investment')),
   opening_balance bigint NOT NULL DEFAULT 0,           -- IDR whole rupiah
+  -- private unless the owner shares it; sharing is read-only (see 003)
+  visibility      text NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','shared')),
   created_at      timestamptz NOT NULL DEFAULT now(),
   UNIQUE (user_id, name)
 );

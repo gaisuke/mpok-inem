@@ -74,6 +74,7 @@
   <div class="tabs" role="tablist">
     <button data-tab="ringkasan" aria-selected="true">Ringkasan</button>
     <button data-tab="transaksi">Transaksi</button>
+    <button data-tab="rumah">Rumah tangga</button>
     <button data-tab="notes">Notes</button>
     <button data-tab="meals">Meals</button>
   </div>
@@ -130,6 +131,15 @@
     </div>
     <h2>Mutasi</h2>
     <ul id="pd-movements"></ul>
+  </section>
+
+  <section id="rumah">
+    <div class="cards">
+      <div class="card"><div class="k">Total rumah tangga</div><div class="v" id="hh-total">—</div>
+        <div class="sub">hanya dompet yang dibagikan</div></div>
+    </div>
+    <div id="hh-members"></div>
+    <p class="empty" style="margin-top:14px">Dompet yang tidak dibagikan tetap pribadi — tidak muncul di sini.</p>
   </section>
 
   <section id="transaksi">
@@ -202,7 +212,27 @@ async function loadPockets() {
     <li class="tappable" data-pocket="${p.id}"><div class="top">
       <span class="name">${esc(p.name)}</span>
       <span class="amt ${p.balance_idr < 0 ? 'out' : ''}">${num(p.balance_idr)}</span>
-    </div><div class="meta"><span class="pill">${esc(p.type)}</span></div></li>`).join('');
+    </div><div class="meta"><span class="pill">${esc(p.type)}</span>${p.visibility === 'shared' ? '<span class="pill">dibagikan</span>' : ''}</div></li>`).join('');
+}
+
+async function loadHousehold() {
+  const box = $('hh-members');
+  try {
+    const d = await api('/api/household');
+    $('hh-total').textContent = num(d.total_balance_idr);
+    const members = d.members || [];
+    if (!members.length) {
+      box.innerHTML = '<h2>Anggota</h2><p class="empty">Belum ada dompet yang dibagikan.</p>';
+      return;
+    }
+    box.innerHTML = members.map(m => `
+      <h2>${esc(m.display_name)} — ${num(m.total_idr)}</h2>
+      <ul>${m.pockets.map(p => `
+        <li class="tappable" data-pocket="${p.id}"><div class="top">
+          <span class="name">${esc(p.name)}</span>
+          <span class="amt">${num(p.balance_idr)}</span>
+        </div><div class="meta"><span class="pill">${esc(p.type)}</span></div></li>`).join('')}</ul>`).join('');
+  } catch (e) { fail(box, e.message); }
 }
 
 async function openPocket(id, period) {
@@ -307,6 +337,7 @@ function showTab(name) {
   document.querySelectorAll('main section').forEach(s => s.classList.toggle('active', s.id === name));
   if (name === 'ringkasan') { loadSummary(); loadPockets(); }
   if (name === 'pocket' && currentPocket) openPocket(currentPocket, $('pd-period').value);
+  if (name === 'rumah') loadHousehold();
   if (name === 'transaksi') loadTxns();
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
@@ -321,6 +352,10 @@ function showPocket(id) {
 
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
 $('pockets').addEventListener('click', (e) => {
+  const li = e.target.closest('li[data-pocket]');
+  if (li) showPocket(li.dataset.pocket);
+});
+$('hh-members').addEventListener('click', (e) => {
   const li = e.target.closest('li[data-pocket]');
   if (li) showPocket(li.dataset.pocket);
 });

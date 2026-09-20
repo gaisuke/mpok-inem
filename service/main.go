@@ -28,7 +28,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func badReq(w http.ResponseWriter, msg string) { writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg}) }
+func badReq(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+}
 
 func qID(s string) (int, error) { return strconv.Atoi(s) }
 
@@ -45,10 +47,10 @@ type HandleReq struct {
 }
 
 type HandleResp struct {
-	ReplyText          string          `json:"reply_text"`
-	RequiresConfirm    bool            `json:"requires_confirmation"`
-	Confidence         float64         `json:"confidence"`
-	SessionUpdate      json.RawMessage `json:"session_update,omitempty"`
+	ReplyText       string          `json:"reply_text"`
+	RequiresConfirm bool            `json:"requires_confirmation"`
+	Confidence      float64         `json:"confidence"`
+	SessionUpdate   json.RawMessage `json:"session_update,omitempty"`
 }
 
 // handlePOST: Phase 0 stub — validates identity, echoes structured ack.
@@ -84,22 +86,49 @@ func handlePOST(w http.ResponseWriter, r *http.Request) {
 // ---------- expense ----------
 
 type pocket struct {
-	ID     int    `json:"id"`
-	Name   string `json:"name"`
-	Type   string `json:"type"`
-	Balance int64 `json:"balance_idr"`
+	ID         int    `json:"id"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Visibility string `json:"visibility"` // private | shared
+	Balance    int64  `json:"balance_idr"`
 }
 
 // effective balance = opening + ins - outs + transfers in - out
-const balanceSQL = `
-SELECT p.id, p.name, p.type,
+const balanceExpr = `
   p.opening_balance
   + COALESCE((SELECT SUM(CASE WHEN t.direction='in' THEN t.amount ELSE -t.amount END)
               FROM expense.transactions t WHERE t.pocket_id=p.id), 0)
   + COALESCE((SELECT SUM(tr.amount) FROM expense.transfers tr WHERE tr.to_pocket=p.id), 0)
-  - COALESCE((SELECT SUM(tr.amount) FROM expense.transfers tr WHERE tr.from_pocket=p.id), 0)
-  AS balance
+  - COALESCE((SELECT SUM(tr.amount) FROM expense.transfers tr WHERE tr.from_pocket=p.id), 0)`
+
+const balanceSQL = `SELECT p.id, p.name, p.type, p.visibility,` + balanceExpr + ` AS balance
 FROM expense.pockets p WHERE p.user_id=$1 ORDER BY p.id`
+
+// pocketSQL reads one pocket the caller may see: their own, or one its owner
+// shared. Sharing is read-only — writes stay scoped by user_id everywhere else.
+const pocketSQL = `SELECT p.id, p.name, p.type, p.visibility,` + balanceExpr + ` AS balance
+FROM expense.pockets p WHERE p.id=$1 AND (p.user_id=$2 OR p.visibility='shared')`
+
+func scanPocket(s interface{ Scan(...any) error }) (pocket, error) {
+	var p pocket
+	err := s.Scan(&p.ID, &p.Name, &p.Type, &p.Visibility, &p.Balance)
+	return p, err
+}
+
+// pocketVisibleTo is the read check used by the entry lists: the caller owns the
+// pocket, or the owner shared it.
+func pocketVisibleTo(userID, pocketID int) (bool, error) {
+	var ok int
+	err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND (user_id=$2 OR visibility='shared')`,
+		pocketID, userID).Scan(&ok)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 func getPockets(w http.ResponseWriter, userID int) {
 	rows, err := db.Query(balanceSQL, userID)
@@ -110,8 +139,8 @@ func getPockets(w http.ResponseWriter, userID int) {
 	defer rows.Close()
 	out := []pocket{}
 	for rows.Next() {
-		var p pocket
-		if err := rows.Scan(&p.ID, &p.Name, &p.Type, &p.Balance); err != nil {
+		p, err := scanPocket(rows)
+		if err != nil {
 			badReq(w, err.Error())
 			return
 		}
@@ -122,9 +151,10 @@ func getPockets(w http.ResponseWriter, userID int) {
 
 func createPocket(w http.ResponseWriter, r *http.Request, userID int) {
 	var in struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-		Opening int64 `json:"opening_balance_idr"`
+		Name       string `json:"name"`
+		Type       string `json:"type"`
+		Opening    int64  `json:"opening_balance_idr"`
+		Visibility string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -141,9 +171,17 @@ func createPocket(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, "type must be cash|savings|investment")
 		return
 	}
+	// private unless the owner says otherwise: sharing is opt-in, never a default
+	if in.Visibility == "" {
+		in.Visibility = "private"
+	}
+	if in.Visibility != "private" && in.Visibility != "shared" {
+		badReq(w, "visibility must be private|shared")
+		return
+	}
 	var id int
-	err := db.QueryRow(`INSERT INTO expense.pockets(user_id,name,type,opening_balance) VALUES($1,$2,$3,$4) RETURNING id`,
-		userID, in.Name, in.Type, in.Opening).Scan(&id)
+	err := db.QueryRow(`INSERT INTO expense.pockets(user_id,name,type,opening_balance,visibility) VALUES($1,$2,$3,$4,$5) RETURNING id`,
+		userID, in.Name, in.Type, in.Opening, in.Visibility).Scan(&id)
 	if err != nil && strings.Contains(err.Error(), "duplicate key") {
 		badReq(w, "pocket name exists")
 		return
@@ -205,10 +243,10 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 
 func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 	var in struct {
-		From int    `json:"from_pocket_id"`
-		To   int    `json:"to_pocket_id"`
-		Amount int64 `json:"amount_idr"`
-		Note string `json:"note"`
+		From   int    `json:"from_pocket_id"`
+		To     int    `json:"to_pocket_id"`
+		Amount int64  `json:"amount_idr"`
+		Note   string `json:"note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -281,9 +319,9 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 	}
 	defer rows.Close()
 	type cat struct {
-		Category string `json:"category"`
+		Category  string `json:"category"`
 		Direction string `json:"direction"`
-		TotalIDR int64 `json:"total_idr"`
+		TotalIDR  int64  `json:"total_idr"`
 	}
 	cats := []cat{}
 	var totalOut, totalIn int64
@@ -305,8 +343,7 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 	if err == nil {
 		defer prows.Close()
 		for prows.Next() {
-			var p pocket
-			if prows.Scan(&p.ID, &p.Name, &p.Type, &p.Balance) == nil {
+			if p, err := scanPocket(prows); err == nil {
 				pockets = append(pockets, p)
 			}
 		}
@@ -323,7 +360,10 @@ func expenseSummary(w http.ResponseWriter, r *http.Request, userID int) {
 	writeJSON(w, 200, resp)
 }
 
-// listTxns: transactions for a period, newest first (detail behind a summary)
+// listTxns: transactions for a period, newest first (detail behind a summary).
+// With ?pocket_id= it serves that pocket's ledger — the caller's own, or one
+// shared with them (access checked first, so a shared pocket's entries are
+// readable while a private one stays invisible).
 func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 	q := r.URL.Query()
 	limit := 50
@@ -335,7 +375,31 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 		}
 		limit = n
 	}
-	where, args := "t.user_id=$1", []any{userID}
+	args := []any{}
+	where := ""
+	if p := q.Get("pocket_id"); p != "" {
+		pid, err := strconv.Atoi(p)
+		if err != nil || pid <= 0 {
+			badReq(w, "pocket_id must be a positive integer")
+			return
+		}
+		ok, err := pocketVisibleTo(userID, pid)
+		if err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		if !ok {
+			forbidden(w, "pocket is not yours and has not been shared")
+			return
+		}
+		// access is proven, so the pocket alone scopes the query — a shared
+		// pocket's entries belong to its owner, not to the caller
+		args = append(args, pid)
+		where = "t.pocket_id=$1"
+	} else {
+		args = append(args, userID)
+		where = "t.user_id=$1"
+	}
 	from, to := q.Get("from"), q.Get("to")
 	if from != "" || to != "" {
 		if from == "" {
@@ -354,8 +418,8 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 			badReq(w, "to must not be before from")
 			return
 		}
-		where += " AND t.created_at::date BETWEEN $2::date AND $3::date"
 		args = append(args, from, to)
+		where += fmt.Sprintf(" AND t.created_at::date BETWEEN $%d::date AND $%d::date", len(args)-1, len(args))
 	}
 	if c := q.Get("category"); c != "" {
 		args = append(args, c)
@@ -368,15 +432,6 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 		}
 		args = append(args, d)
 		where += fmt.Sprintf(" AND t.direction=$%d", len(args))
-	}
-	if p := q.Get("pocket_id"); p != "" {
-		pid, err := strconv.Atoi(p)
-		if err != nil || pid <= 0 {
-			badReq(w, "pocket_id must be a positive integer")
-			return
-		}
-		args = append(args, pid)
-		where += fmt.Sprintf(" AND t.pocket_id=$%d", len(args))
 	}
 	args = append(args, limit)
 	rows, err := db.Query(fmt.Sprintf(txnSelect+` WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
@@ -397,14 +452,54 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 	writeJSON(w, 200, out)
 }
 
+// household: every member's *shared* pockets, for the family view. Private
+// pockets never leave their owner, and this endpoint is read-only — a shared
+// pocket can be looked at by the others, never written to by them.
+func household(w http.ResponseWriter, r *http.Request, userID int) {
+	rows, err := db.Query(`SELECT u.id, u.display_name, p.id, p.name, p.type, p.visibility,` + balanceExpr + ` AS balance
+		FROM inem_auth.users u
+		JOIN expense.pockets p ON p.user_id=u.id AND p.visibility='shared'
+		ORDER BY u.id, p.id`)
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	defer rows.Close()
+	type memberView struct {
+		UserID      int      `json:"user_id"`
+		DisplayName string   `json:"display_name"`
+		Pockets     []pocket `json:"pockets"`
+		TotalIDR    int64    `json:"total_idr"`
+	}
+	members := []memberView{}
+	var grand int64
+	for rows.Next() {
+		var uid int
+		var name string
+		var p pocket
+		if err := rows.Scan(&uid, &name, &p.ID, &p.Name, &p.Type, &p.Visibility, &p.Balance); err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		if len(members) == 0 || members[len(members)-1].UserID != uid {
+			members = append(members, memberView{UserID: uid, DisplayName: name, Pockets: []pocket{}})
+		}
+		m := &members[len(members)-1]
+		m.Pockets = append(m.Pockets, p)
+		m.TotalIDR += p.Balance
+		grand += p.Balance
+	}
+	writeJSON(w, 200, map[string]any{"members": members, "total_balance_idr": grand})
+}
+
 // ---------- brain ----------
 
 type note struct {
-	ID     int64    `json:"id"`
-	Title  string   `json:"title"`
-	BodyMD string   `json:"body_md"`
-	Tags   []string `json:"tags"`
-	Updated string  `json:"updated_at"`
+	ID      int64    `json:"id"`
+	Title   string   `json:"title"`
+	BodyMD  string   `json:"body_md"`
+	Tags    []string `json:"tags"`
+	Updated string   `json:"updated_at"`
 }
 
 func scanNote(s interface{ Scan(...any) error }) (note, error) {
@@ -522,12 +617,12 @@ func createMeal(w http.ResponseWriter, r *http.Request, userID int) {
 		Source   string `json:"source"`
 		Note     string `json:"note"`
 		Items    []struct {
-			Name     string  `json:"name"`
-			EstGrams int     `json:"est_grams"`
-			Calories int     `json:"calories"`
-			Protein  float64 `json:"protein"`
-			Carbs    float64 `json:"carbs"`
-			Fat      float64 `json:"fat"`
+			Name       string  `json:"name"`
+			EstGrams   int     `json:"est_grams"`
+			Calories   int     `json:"calories"`
+			Protein    float64 `json:"protein"`
+			Carbs      float64 `json:"carbs"`
+			Fat        float64 `json:"fat"`
 			Confidence float64 `json:"confidence"`
 		} `json:"items"`
 	}
@@ -581,12 +676,12 @@ func dailyRollup(w http.ResponseWriter, r *http.Request, userID int) {
 		day = d
 	}
 	type rollup struct {
-		Day      string `json:"day"`
-		Calories int    `json:"calories"`
+		Day      string  `json:"day"`
+		Calories int     `json:"calories"`
 		Protein  float64 `json:"protein_g"`
 		Carbs    float64 `json:"carbs_g"`
 		Fat      float64 `json:"fat_g"`
-		Target   *int   `json:"calorie_target,omitempty"`
+		Target   *int    `json:"calorie_target,omitempty"`
 	}
 	var r0 rollup
 	var target sql.NullInt64
@@ -620,6 +715,10 @@ func conflict(w http.ResponseWriter, msg string) {
 
 func notFound(w http.ResponseWriter, msg string) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": msg})
+}
+
+func forbidden(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg})
 }
 
 func confirmOK(r *http.Request) bool { return r.URL.Query().Get("confirm") == "true" }
@@ -679,9 +778,7 @@ func limitParam(r *http.Request, def, max int) (int, string) {
 // ---------- expense: pockets and entries ----------
 
 func fetchPocket(w http.ResponseWriter, userID, id int) (pocket, bool) {
-	var p pocket
-	err := db.QueryRow(`SELECT id, name, type, balance FROM (`+balanceSQL+`) q WHERE id=$2`, userID, id).
-		Scan(&p.ID, &p.Name, &p.Type, &p.Balance)
+	p, err := scanPocket(db.QueryRow(pocketSQL, id, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		notFound(w, "pocket not found")
 		return p, false
@@ -695,16 +792,17 @@ func fetchPocket(w http.ResponseWriter, userID, id int) (pocket, bool) {
 
 func updatePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
 	var in struct {
-		Name    *string `json:"name"`
-		Type    *string `json:"type"`
-		Opening *int64  `json:"opening_balance_idr"`
+		Name       *string `json:"name"`
+		Type       *string `json:"type"`
+		Opening    *int64  `json:"opening_balance_idr"`
+		Visibility *string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
 		return
 	}
-	if in.Name == nil && in.Type == nil && in.Opening == nil {
-		badReq(w, "nothing to update: send name, type or opening_balance_idr")
+	if in.Name == nil && in.Type == nil && in.Opening == nil && in.Visibility == nil {
+		badReq(w, "nothing to update: send name, type, opening_balance_idr or visibility")
 		return
 	}
 	sets := []string{}
@@ -733,6 +831,14 @@ func updatePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
 		args = append(args, *in.Opening)
 		sets = append(sets, fmt.Sprintf("opening_balance=$%d", len(args)))
 	}
+	if in.Visibility != nil {
+		if *in.Visibility != "private" && *in.Visibility != "shared" {
+			badReq(w, "visibility must be private|shared")
+			return
+		}
+		args = append(args, *in.Visibility)
+		sets = append(sets, fmt.Sprintf("visibility=$%d", len(args)))
+	}
 	res, err := db.Exec(`UPDATE expense.pockets SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
@@ -756,8 +862,20 @@ func deletePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
 		badReq(w, "confirm=true required")
 		return
 	}
+	// ownership first: a pocket shared with someone else is still not theirs to
+	// delete, and the answer must not reveal whether it has entries
+	var owner int
+	err := db.QueryRow(`SELECT user_id FROM expense.pockets WHERE id=$1 AND user_id=$2`, id, userID).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		notFound(w, "pocket not found")
+		return
+	}
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
 	var refs int
-	err := db.QueryRow(`SELECT (SELECT count(*) FROM expense.transactions WHERE pocket_id=$1)
+	err = db.QueryRow(`SELECT (SELECT count(*) FROM expense.transactions WHERE pocket_id=$1)
 		+ (SELECT count(*) FROM expense.transfers WHERE from_pocket=$1 OR to_pocket=$1)`, id).Scan(&refs)
 	if err != nil {
 		badReq(w, err.Error())
@@ -889,6 +1007,11 @@ type transfer struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// listTransfers: transfers for a period. With ?pocket_id= it serves the moves in
+// or out of that pocket (its owner's or one shared with the caller). A
+// counterparty pocket the caller may not see is masked: the movement stays
+// visible — a shared pocket's balance must still add up — but the private
+// pocket's name does not leak.
 func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 	limit, msg := limitParam(r, 50, 500)
 	if msg != "" {
@@ -900,7 +1023,26 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, msg)
 		return
 	}
-	where, args := "tr.user_id=$1", []any{userID}
+	args := []any{userID} // $1 is the caller: it also drives the masking below
+	where := "tr.user_id=$1"
+	if p := r.URL.Query().Get("pocket_id"); p != "" {
+		pid, err := strconv.Atoi(p)
+		if err != nil || pid <= 0 {
+			badReq(w, "pocket_id must be a positive integer")
+			return
+		}
+		ok, err := pocketVisibleTo(userID, pid)
+		if err != nil {
+			badReq(w, err.Error())
+			return
+		}
+		if !ok {
+			forbidden(w, "pocket is not yours and has not been shared")
+			return
+		}
+		args = append(args, pid)
+		where = fmt.Sprintf("(tr.from_pocket=$%d OR tr.to_pocket=$%d)", len(args), len(args))
+	}
 	if m := r.URL.Query().Get("month"); m != "" {
 		if _, err := time.Parse("2006-01", m); err != nil {
 			badReq(w, "month must be YYYY-MM")
@@ -912,19 +1054,12 @@ func listTransfers(w http.ResponseWriter, r *http.Request, userID int) {
 		args = append(args, from, to)
 		where += fmt.Sprintf(" AND tr.created_at::date BETWEEN $%d::date AND $%d::date", len(args)-1, len(args))
 	}
-	// a pocket's transfers are the ones leaving it or arriving in it
-	if p := r.URL.Query().Get("pocket_id"); p != "" {
-		pid, err := strconv.Atoi(p)
-		if err != nil || pid <= 0 {
-			badReq(w, "pocket_id must be a positive integer")
-			return
-		}
-		args = append(args, pid)
-		where += fmt.Sprintf(" AND (tr.from_pocket=$%d OR tr.to_pocket=$%d)", len(args), len(args))
-	}
 	args = append(args, limit)
-	rows, err := db.Query(fmt.Sprintf(`SELECT tr.id, tr.from_pocket, pf.name, tr.to_pocket, pt.name, tr.amount,
-		COALESCE(tr.note,''), tr.created_at
+	rows, err := db.Query(fmt.Sprintf(`SELECT tr.id, tr.from_pocket,
+		CASE WHEN pf.user_id=$1 OR pf.visibility='shared' THEN pf.name ELSE '(pribadi)' END,
+		tr.to_pocket,
+		CASE WHEN pt.user_id=$1 OR pt.visibility='shared' THEN pt.name ELSE '(pribadi)' END,
+		tr.amount, COALESCE(tr.note,''), tr.created_at
 		FROM expense.transfers tr
 		JOIN expense.pockets pf ON pf.id=tr.from_pocket
 		JOIN expense.pockets pt ON pt.id=tr.to_pocket
@@ -1598,6 +1733,7 @@ func allRoutes() []route {
 		{"DELETE", "/v1/transfers/{id}", withUserID(deleteTransfer)},
 
 		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
+		{"GET", "/v1/household", withUser(household)},
 
 		{"POST", "/v1/admin/reset", withUser(resetData)},
 		{"GET", "/v1/admin/users", listUsers},

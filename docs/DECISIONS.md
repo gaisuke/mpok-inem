@@ -113,3 +113,22 @@ Consequences worth keeping:
   the dashboard still works when telegram.org is unreachable.
 - Per-pocket sharing (`shared` vs `private`) is still to come; when it lands it
   must be read-only for non-owners and default to private.
+
+## D6 — Pocket sharing is opt-in, read-only, and masks private counterparties (2026-09-20)
+
+`expense.pockets.visibility` is `private` by default; the owner shares a pocket
+explicitly. The rules that keep this from leaking:
+
+- **Read-only, always.** A shared pocket is readable by the other members
+  (`GET /v1/pockets/{id}`, its ledger, its moves); every write path stays scoped
+  by `user_id`, so a non-owner gets `404` on rename/retype/unshare/delete and
+  `400` when spending from it. Deleting checks ownership *before* counting
+  entries, so the error cannot even reveal whether the pocket has rows.
+- **A shared ledger must still add up.** Entries and transfers of a shared pocket
+  are fully listed — hiding a movement would make the balance look wrong — but a
+  counterparty pocket the reader cannot see is masked as `(pribadi)`. The money
+  moves are transparent; private pocket names are not.
+- **Private stays private everywhere:** the single-pocket read, the entry lists
+  (`403`) and `/v1/household` (which returns shared pockets only, per member).
+- `GET /v1/transactions?pocket_id=` scopes by pocket *after* the access check
+  rather than by `user_id`, because a shared pocket's rows belong to its owner.
