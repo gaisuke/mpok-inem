@@ -133,20 +133,6 @@ explicitly. The rules that keep this from leaking:
 - `GET /v1/transactions?pocket_id=` scopes by pocket *after* the access check
   rather than by `user_id`, because a shared pocket's rows belong to its owner.
 
-## D10 — Amounts are hidden by default (2026-09-21)
-
-- **Money is private in public.** Opening the dashboard in a public place (or over
-  someone's shoulder) must not show figures, so every amount starts masked
-  (`••••••`) and one tap on the eye button reveals them. The flag is a plain
-  in-memory variable — never persisted — so a fresh load (a new glance at the
-  phone) is hidden again; verified by reloading after revealing.
-- **One choke point.** Every amount in the UI is rendered through `num()`, so the
-  flag cannot be half-applied; the category bars, which are amounts drawn as
-  lengths, collapse to a uniform width while hidden rather than leaking relative
-  sizes. Verified tab by tab (Ringkasan, Transaksi, Rumah tangga, Jadwal, and a
-  pocket's detail): no money-looking text on screen while hidden, all of it back
-  when revealed.
-
 ## D9 — Recurring plans are reminders, not auto-writes (2026-09-20)
 
 - **The ledger only records what a human confirms.** His bank already moves the
