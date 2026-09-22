@@ -9,40 +9,54 @@ package main
 // this database.
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 type topic struct {
-	ID        int64   `json:"id"`
-	Topic     string  `json:"topic"`
-	Niche     string  `json:"niche"`
-	Source    string  `json:"source"`
-	Score     float64 `json:"score"`
-	Status    string  `json:"status"`
-	CreatedAt string  `json:"created_at"`
+	ID            int64   `json:"id"`
+	Topic         string  `json:"topic"`
+	Niche         string  `json:"niche"`
+	Source        string  `json:"source"`
+	Score         float64 `json:"score"`
+	Status        string  `json:"status"`
+	Angle         string  `json:"angle"`
+	MaterialTitle string  `json:"material_title"`
+	MaterialURL   string  `json:"material_url"`
+	CreatedAt     string  `json:"created_at"`
 }
 
 type contentDraft struct {
-	ID          int64    `json:"id"`
-	TopicID     *int64   `json:"topic_id"`
-	Platform    string   `json:"platform"`
-	Niche       string   `json:"niche"`
-	Topic       string   `json:"topic"`
-	Hook        string   `json:"hook"`
-	Body        string   `json:"body"`
-	Parts       []string `json:"parts"`
-	Fingerprint string   `json:"fingerprint"`
-	Status      string   `json:"status"`
-	Model       string   `json:"model"`
-	RunID       *int64   `json:"run_id"`
-	CreatedAt   string   `json:"created_at"`
-	PublishedAt string   `json:"published_at"`
+	ID            int64    `json:"id"`
+	TopicID       *int64   `json:"topic_id"`
+	Platform      string   `json:"platform"`
+	Niche         string   `json:"niche"`
+	Topic         string   `json:"topic"`
+	Hook          string   `json:"hook"`
+	Body          string   `json:"body"`
+	Parts         []string `json:"parts"`
+	Fingerprint   string   `json:"fingerprint"`
+	Status        string   `json:"status"`
+	Model         string   `json:"model"`
+	MaterialTitle string   `json:"material_title"`
+	MaterialURL   string   `json:"material_url"`
+	PostID        string   `json:"post_id"`
+	RunID         *int64   `json:"run_id"`
+	CreatedAt     string   `json:"created_at"`
+	PublishedAt   string   `json:"published_at"`
 }
 
 // requireFullScope gates features that are not open to a finance-only member yet
@@ -101,7 +115,8 @@ func listTopics(w http.ResponseWriter, r *http.Request, userID int) {
 		return
 	}
 	args = append(args, limit)
-	rows, err := db.Query(fmt.Sprintf(`SELECT id, topic, niche, source, score, status, created_at
+	rows, err := db.Query(fmt.Sprintf(`SELECT id, topic, niche, source, score, status,
+		COALESCE(angle,''), COALESCE(material_title,''), COALESCE(material_url,''), created_at
 		FROM content.topics WHERE %s ORDER BY score DESC, id DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
 		badReq(w, err.Error())
@@ -112,7 +127,8 @@ func listTopics(w http.ResponseWriter, r *http.Request, userID int) {
 	for rows.Next() {
 		var t topic
 		var ts time.Time
-		if err := rows.Scan(&t.ID, &t.Topic, &t.Niche, &t.Source, &t.Score, &t.Status, &ts); err != nil {
+		if err := rows.Scan(&t.ID, &t.Topic, &t.Niche, &t.Source, &t.Score, &t.Status,
+			&t.Angle, &t.MaterialTitle, &t.MaterialURL, &ts); err != nil {
 			badReq(w, err.Error())
 			return
 		}
@@ -138,11 +154,14 @@ func validDraftStatus(s string) bool {
 // the same buzzword showing up twice in a day is normal.
 func createTopics(w http.ResponseWriter, r *http.Request, userID int) {
 	var in struct {
-		Topic  string   `json:"topic"`
-		Topics []string `json:"topics"`
-		Niche  string   `json:"niche"`
-		Source string   `json:"source"`
-		Score  float64  `json:"score"`
+		Topic         string   `json:"topic"`
+		Topics        []string `json:"topics"`
+		Niche         string   `json:"niche"`
+		Source        string   `json:"source"`
+		Score         float64  `json:"score"`
+		Angle         string   `json:"angle"`
+		MaterialTitle string   `json:"material_title"`
+		MaterialURL   string   `json:"material_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -173,12 +192,20 @@ func createTopics(w http.ResponseWriter, r *http.Request, userID int) {
 		var inserted bool
 		// xmax = 0 means this row was inserted now, not matched by the conflict
 		// clause — RETURNING alone cannot tell the two apart
-		err := db.QueryRow(`INSERT INTO content.topics(user_id, topic, niche, source, score)
-			VALUES($1,$2,$3,$4,$5)
-			ON CONFLICT (user_id, topic) DO UPDATE SET score=GREATEST(content.topics.score, EXCLUDED.score)
-			RETURNING id, topic, niche, source, score, status, created_at, (xmax = 0)`,
-			userID, name, in.Niche, in.Source, in.Score).
-			Scan(&t.ID, &t.Topic, &t.Niche, &t.Source, &t.Score, &t.Status, &ts, &inserted)
+		// On a repeat, the material is filled in only where it is still empty:
+		// a later run must not overwrite a better angle with a worse one.
+		err := db.QueryRow(`INSERT INTO content.topics(user_id, topic, niche, source, score, angle, material_title, material_url)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+			ON CONFLICT (user_id, topic) DO UPDATE SET
+				score            = GREATEST(content.topics.score, EXCLUDED.score),
+				angle            = COALESCE(content.topics.angle, EXCLUDED.angle),
+				material_title   = COALESCE(content.topics.material_title, EXCLUDED.material_title),
+				material_url     = COALESCE(content.topics.material_url, EXCLUDED.material_url)
+			RETURNING id, topic, niche, source, score, status,
+				COALESCE(angle,''), COALESCE(material_title,''), COALESCE(material_url,''), created_at, (xmax = 0)`,
+			userID, name, in.Niche, in.Source, in.Score, in.Angle, in.MaterialTitle, in.MaterialURL).
+			Scan(&t.ID, &t.Topic, &t.Niche, &t.Source, &t.Score, &t.Status,
+				&t.Angle, &t.MaterialTitle, &t.MaterialURL, &ts, &inserted)
 		if err != nil {
 			badReq(w, err.Error())
 			return
@@ -195,15 +222,27 @@ func createTopics(w http.ResponseWriter, r *http.Request, userID int) {
 
 func updateTopic(w http.ResponseWriter, r *http.Request, userID, id int) {
 	var in struct {
-		Status *string  `json:"status"`
-		Niche  *string  `json:"niche"`
-		Score  *float64 `json:"score"`
+		Status        *string  `json:"status"`
+		Niche         *string  `json:"niche"`
+		Score         *float64 `json:"score"`
+		Angle         *string  `json:"angle"`
+		MaterialTitle *string  `json:"material_title"`
+		MaterialURL   *string  `json:"material_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
 		return
 	}
 	sets, args := []string{}, []any{userID, id}
+	for _, f := range []struct {
+		val *string
+		col string
+	}{{in.Angle, "angle"}, {in.MaterialTitle, "material_title"}, {in.MaterialURL, "material_url"}} {
+		if f.val != nil {
+			args = append(args, *f.val)
+			sets = append(sets, fmt.Sprintf("%s=$%d", f.col, len(args)))
+		}
+	}
 	if in.Status != nil {
 		if !validTopicStatus(*in.Status) {
 			badReq(w, "status must be new|used|skipped")
@@ -255,7 +294,9 @@ func deleteTopic(w http.ResponseWriter, r *http.Request, userID, id int) {
 }
 
 const draftSelect = `SELECT d.id, d.topic_id, d.platform, d.niche, d.topic, COALESCE(d.hook,''),
-	d.body, d.parts, d.fingerprint, d.status, COALESCE(d.model,''), d.run_id, d.created_at, d.published_at
+	d.body, d.parts, d.fingerprint, d.status, COALESCE(d.model,''),
+	COALESCE(d.material_title,''), COALESCE(d.material_url,''), COALESCE(d.post_id,''),
+	d.run_id, d.created_at, d.published_at
 	FROM content.drafts d`
 
 func scanDraft(s interface{ Scan(...any) error }) (contentDraft, error) {
@@ -264,7 +305,8 @@ func scanDraft(s interface{ Scan(...any) error }) (contentDraft, error) {
 	var ts time.Time
 	var pub sql.NullTime
 	err := s.Scan(&d.ID, &d.TopicID, &d.Platform, &d.Niche, &d.Topic, &d.Hook, &d.Body, &parts,
-		&d.Fingerprint, &d.Status, &d.Model, &d.RunID, &ts, &pub)
+		&d.Fingerprint, &d.Status, &d.Model, &d.MaterialTitle, &d.MaterialURL, &d.PostID,
+		&d.RunID, &ts, &pub)
 	if err != nil {
 		return d, err
 	}
@@ -336,16 +378,18 @@ func getDraft(w http.ResponseWriter, r *http.Request, userID, id int) {
 // per member, so the same idea cannot be queued twice by two runs.
 func createDraft(w http.ResponseWriter, r *http.Request, userID int) {
 	var in struct {
-		TopicID     *int64   `json:"topic_id"`
-		Platform    string   `json:"platform"`
-		Niche       string   `json:"niche"`
-		Topic       string   `json:"topic"`
-		Hook        string   `json:"hook"`
-		Body        string   `json:"body"`
-		Parts       []string `json:"parts"`
-		Fingerprint string   `json:"fingerprint"`
-		Model       string   `json:"model"`
-		RunID       *int64   `json:"run_id"`
+		TopicID       *int64   `json:"topic_id"`
+		Platform      string   `json:"platform"`
+		Niche         string   `json:"niche"`
+		Topic         string   `json:"topic"`
+		Hook          string   `json:"hook"`
+		Body          string   `json:"body"`
+		Parts         []string `json:"parts"`
+		Fingerprint   string   `json:"fingerprint"`
+		Model         string   `json:"model"`
+		MaterialTitle string   `json:"material_title"`
+		MaterialURL   string   `json:"material_url"`
+		RunID         *int64   `json:"run_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -369,16 +413,17 @@ func createDraft(w http.ResponseWriter, r *http.Request, userID int) {
 	if len(in.Parts) == 0 {
 		in.Parts = []string{in.Body}
 	}
-	if in.Fingerprint == "" {
-		badReq(w, "fingerprint required (the generator's de-duplication key)")
-		return
+	if strings.TrimSpace(in.Fingerprint) == "" {
+		// Written by hand in the dashboard: the de-duplication key is derived
+		// here instead of being demanded from the author.
+		in.Fingerprint = fingerprintOf(in.Body)
 	}
 	parts, _ := json.Marshal(in.Parts)
 	var id int64
-	err := db.QueryRow(`INSERT INTO content.drafts(user_id, topic_id, platform, niche, topic, hook, body, parts, fingerprint, model, run_id)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+	err := db.QueryRow(`INSERT INTO content.drafts(user_id, topic_id, platform, niche, topic, hook, body, parts, fingerprint, model, material_title, material_url, run_id)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		userID, in.TopicID, in.Platform, in.Niche, in.Topic, in.Hook, in.Body, parts,
-		in.Fingerprint, in.Model, in.RunID).Scan(&id)
+		in.Fingerprint, in.Model, in.MaterialTitle, in.MaterialURL, in.RunID).Scan(&id)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
 			writeJSON(w, 409, map[string]any{"error": "draft with this fingerprint already exists"})
@@ -401,6 +446,7 @@ func updateDraft(w http.ResponseWriter, r *http.Request, userID, id int) {
 		Status *string   `json:"status"`
 		Body   *string   `json:"body"`
 		Parts  *[]string `json:"parts"`
+		PostID *string   `json:"post_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -431,8 +477,12 @@ func updateDraft(w http.ResponseWriter, r *http.Request, userID, id int) {
 		args = append(args, parts)
 		sets = append(sets, fmt.Sprintf("parts=$%d", len(args)))
 	}
+	if in.PostID != nil {
+		args = append(args, *in.PostID)
+		sets = append(sets, fmt.Sprintf("post_id=$%d", len(args)))
+	}
 	if len(sets) == 0 {
-		badReq(w, "nothing to update: send status, body or parts")
+		badReq(w, "nothing to update: send status, body, parts or post_id")
 		return
 	}
 	res, err := db.Exec(`UPDATE content.drafts SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
@@ -449,6 +499,88 @@ func updateDraft(w http.ResponseWriter, r *http.Request, userID, id int) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"updated": 1})
+}
+
+// fingerprintOf is the engine's de-duplication key, reimplemented so a draft
+// typed straight into the dashboard is deduplicated the same way as a generated
+// one: sorted, unique, stopword-free tokens, hashed. Kept identical to
+// app/content_generator.py:fingerprint on purpose.
+var fpToken = regexp.MustCompile(`[a-z0-9]+`)
+
+var fpStopwords = map[string]bool{
+	"yang": true, "dan": true, "di": true, "ke": true, "dari": true, "itu": true,
+	"ini": true, "aku": true, "saya": true, "kamu": true, "kita": true,
+	"untuk": true, "dengan": true, "tidak": true, "gak": true, "ga": true,
+	"ada": true, "juga": true, "bisa": true, "akan": true, "atau": true,
+	"the": true, "a": true, "an": true, "to": true, "of": true, "is": true,
+	"it": true, "and": true, "in": true, "on": true, "for": true, "my": true, "i": true,
+}
+
+func fingerprintOf(text string) string {
+	seen := map[string]bool{}
+	tokens := []string{}
+	for _, t := range fpToken.FindAllString(strings.ToLower(text), -1) {
+		if len(t) > 2 && !fpStopwords[t] && !seen[t] {
+			seen[t] = true
+			tokens = append(tokens, t)
+		}
+	}
+	sort.Strings(tokens)
+	sum := sha1.Sum([]byte(strings.Join(tokens, " ")))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// polishContent: "rapikan dengan AI" in the editor. The words stay the author's —
+// the engine only fixes spelling, spacing and flow, and is told not to rewrite.
+// The call is forwarded to the engine because that is where the voice prompts and
+// the model credentials live; this service holds no LLM key.
+func polishContent(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Text  string `json:"text"`
+		Niche string `json:"niche"`
+		Mode  string `json:"mode"` // "" = rapikan | "hook" = usulkan hook
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if strings.TrimSpace(in.Text) == "" {
+		badReq(w, "text required")
+		return
+	}
+	if len(in.Text) > 8000 {
+		badReq(w, "text too long (max 8000 chars)")
+		return
+	}
+	engine := os.Getenv("INEM_ENGINE_URL")
+	if engine == "" {
+		engine = "http://127.0.0.1:8000"
+	}
+	payload, _ := json.Marshal(map[string]string{"text": in.Text, "niche": in.Niche, "mode": in.Mode})
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(engine, "/")+"/polish", bytes.NewReader(payload))
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": "engine tidak bisa dihubungi (" + engine + "): " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": fmt.Sprintf("engine menolak (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(raw)
 }
 
 func deleteDraft(w http.ResponseWriter, r *http.Request, userID, id int) {

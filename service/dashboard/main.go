@@ -1,8 +1,10 @@
 // inemdash — read-only dashboard for the inemd household data.
 //
 // Serves one static page plus a small JSON passthrough that talks to inemd on
-// 127.0.0.1. Only GET routes reach inemd: there is no write path through this
-// binary at all, so exposing it (nginx + TLS) can never change the ledger.
+// 127.0.0.1. The ledger is read-only through this binary: the only routes that
+// write are the content ones (/api/ideas, /api/drafts and the editor's polish
+// call), which deal in ideas and drafts about posts — never money. That is why
+// there is no generic write passthrough, only those named routes.
 //
 // Identity comes from inemgate: Telegram signs the Mini App's initData, and
 // only inemgate holds the bot token needed to check that signature. This binary
@@ -38,6 +40,7 @@ type server struct {
 	authUser string // break-glass basic-auth user
 	passwd   string // empty = no break-glass login at all
 	client   *http.Client
+	slow     *http.Client // for the LLM-backed call, which outlives the 15s budget
 }
 
 type identity struct {
@@ -86,7 +89,68 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /api/target", s.authed(s.pass("/v1/nutrition/target", func(r *http.Request) (string, error) {
 		return "?day=" + dayOr(r, time.Now().Format("2006-01-02")), nil
 	})))
+
+	// Bank ide + editor. The dashboard was read-only by design and stays so for
+	// the ledger: every write below touches content.* only — ideas and drafts,
+	// never money. That is why they are spelled out one by one instead of a
+	// generic passthrough.
+	mux.HandleFunc("GET /api/ideas", s.authed(s.pass("/v1/content/topics", func(r *http.Request) (string, error) {
+		return "?status=" + statusOr(r, "new") + "&limit=" + limitOr(r, "100", "200"), nil
+	})))
+	mux.HandleFunc("PATCH /api/ideas/{id}", s.authed(s.ideaWrite))
+	mux.HandleFunc("POST /api/ideas/polish", s.authed(s.polish))
+	mux.HandleFunc("GET /api/drafts", s.authed(s.pass("/v1/content/drafts", func(r *http.Request) (string, error) {
+		return "?status=" + statusOr(r, "pending") + "&limit=" + limitOr(r, "50", "200"), nil
+	})))
+	mux.HandleFunc("POST /api/drafts", s.authed(s.draftWrite))
+	mux.HandleFunc("PATCH /api/drafts/{id}", s.authed(s.draftUpdate))
 	return mux
+}
+
+func statusOr(r *http.Request, fallback string) string {
+	v := strings.TrimSpace(r.URL.Query().Get("status"))
+	if v == "" {
+		return fallback
+	}
+	return urlQueryEscape(v)
+}
+
+// ideaWrite lets an idea be marked used or skipped from the page.
+func (s *server) ideaWrite(w http.ResponseWriter, r *http.Request, id identity) {
+	pid, err := pathID(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad id"})
+		return
+	}
+	s.send(w, r, http.MethodPatch, "/v1/content/topics/"+pid, id.UserID)
+}
+
+// polish fronts the engine's "rapikan dengan AI"; inemd proxies it on.
+func (s *server) polish(w http.ResponseWriter, r *http.Request, id identity) {
+	s.sendSlow(w, r, http.MethodPost, "/v1/content/polish", id.UserID)
+}
+
+// draftWrite is the editor's save: a post Dani typed himself goes into the queue.
+func (s *server) draftWrite(w http.ResponseWriter, r *http.Request, id identity) {
+	s.send(w, r, http.MethodPost, "/v1/content/drafts", id.UserID)
+}
+
+// draftUpdate is approve/reject/edit — the review step, from the page.
+func (s *server) draftUpdate(w http.ResponseWriter, r *http.Request, id identity) {
+	pid, err := pathID(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad id"})
+		return
+	}
+	s.send(w, r, http.MethodPatch, "/v1/content/drafts/"+pid, id.UserID)
+}
+
+func pathID(r *http.Request) (string, error) {
+	pid := strings.TrimSpace(r.PathValue("id"))
+	if _, err := strconv.Atoi(pid); pid == "" || err != nil {
+		return "", fmt.Errorf("id must be a positive integer")
+	}
+	return pid, nil
 }
 
 // ---------- identity ----------
@@ -362,6 +426,44 @@ func (s *server) get(r *http.Request, target string, uid int) ([]byte, int, erro
 	return body, resp.StatusCode, nil
 }
 
+// send is the write path, used only by the content routes. The ledger stays
+// read-only through this binary: nothing here can move money.
+func (s *server) send(w http.ResponseWriter, r *http.Request, method, target string, uid int) {
+	s.sendWith(s.client, w, r, method, target, uid)
+}
+
+// sendSlow is for the one call that waits on an LLM. The default 15s budget is
+// right for reading a ledger and far too short for "rapikan dengan AI", which
+// showed up as "inemd unreachable" while the engine was working fine.
+func (s *server) sendSlow(w http.ResponseWriter, r *http.Request, method, target string, uid int) {
+	s.sendWith(s.slow, w, r, method, target, uid)
+}
+
+func (s *server) sendWith(c *http.Client, w http.ResponseWriter, r *http.Request, method, target string, uid int) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 256<<10))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unreadable body"})
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, s.upstream+target, bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("X-User-ID", strconv.Itoa(uid))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "inemd unreachable: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(raw)
+}
+
 // fetch is a GET that treats a non-2xx as an error (used by the composed view).
 func (s *server) fetch(r *http.Request, target string, uid int) ([]byte, error) {
 	body, code, err := s.get(r, target, uid)
@@ -601,12 +703,14 @@ func main() {
 		authUser: env("INEM_WEB_AUTH_USER", "dani"),
 		passwd:   os.Getenv("INEM_WEB_AUTH_PASS"),
 		client:   &http.Client{Timeout: 15 * time.Second},
+		slow:     &http.Client{Timeout: 120 * time.Second},
 	}
 	addr := env("INEM_WEB_ADDR", "127.0.0.1:8090")
 	if s.passwd == "" {
 		log.Printf("break-glass password login disabled (INEM_WEB_AUTH_PASS unset)")
 	}
 	log.Printf("inemdash listening on %s (inemd %s, gate %s)", addr, s.upstream, s.gate)
-	srv := &http.Server{Addr: addr, Handler: s.handler(), ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second}
+	// WriteTimeout covers the polish call too: the browser waits for the model
+	srv := &http.Server{Addr: addr, Handler: s.handler(), ReadTimeout: 15 * time.Second, WriteTimeout: 180 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }

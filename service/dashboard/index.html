@@ -73,6 +73,12 @@
   .bar { height: 6px; background: #202634; border-radius: 4px; margin-top: 6px; overflow: hidden; }
   .bar i { display: block; height: 100%; background: var(--accent); }
   .click { cursor: pointer; }
+  textarea { background: var(--card); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px; font: inherit; line-height: 1.5; resize: vertical; }
+  textarea:focus { outline: 1px solid var(--accent); }
+  #ide-editor { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; margin-bottom: 14px; }
+  #ed-status button { margin: 4px 4px 0 0; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -85,6 +91,7 @@
     <button data-tab="jadwal">Jadwal</button>
     <button data-tab="notes">Notes</button>
     <button data-tab="meals">Meals</button>
+    <button data-tab="ide">Ide</button>
   </div>
 </header>
 <div id="login" hidden>
@@ -193,6 +200,44 @@
     </div>
     <h2>Riwayat makan</h2>
     <ul id="meals-list"></ul>
+  </section>
+
+  <!-- Bank ide: bahan + sudut dari kurator, lalu editor untuk menulis sendiri.
+       Bedanya penting: yang disimpan adalah IDE (topik + sudut + tautan bahan),
+       bukan teks artikel. Tulisannya milik Dani. -->
+  <section id="ide">
+    <div class="row">
+      <button class="act" id="ide-refresh">Muat ide</button>
+      <span class="meta" id="ide-hint">ide datang dari bahan bacaan: daily.dev, dev.to, HN, RSS IT</span>
+    </div>
+    <ul id="ideas-list"></ul>
+
+    <div id="ide-editor" hidden>
+      <h2 id="ed-heading">Tulis</h2>
+      <div class="row">
+        <select id="ed-niche">
+          <option value="teknologi">teknologi</option>
+          <option value="life">life</option>
+          <option value="keuangan pribadi">keuangan pribadi</option>
+        </select>
+        <input id="ed-topic" placeholder="topik">
+      </div>
+      <div id="ed-angle" class="meta" style="margin-bottom:8px"></div>
+      <input id="ed-hook" placeholder="hook (baris pertama, opsional)" style="width:100%;margin-bottom:8px">
+      <textarea id="ed-body" rows="10" placeholder="Tulis postnya di sini…" style="width:100%"></textarea>
+      <div class="meta" id="ed-count" style="margin-top:6px"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="act" id="ed-polish">Rapikan dengan AI</button>
+        <button class="act" id="ed-hooks">Usul hook</button>
+        <button class="act" id="ed-save">Simpan jadi draf</button>
+        <button class="act" id="ed-cancel">Batal</button>
+      </div>
+      <div class="meta" id="ed-status"></div>
+      <div id="ed-material" class="meta" style="margin-top:8px"></div>
+    </div>
+
+    <h2>Antrean draf</h2>
+    <ul id="drafts-list"></ul>
   </section>
 </main>
 <script>
@@ -393,6 +438,198 @@ async function loadMeals() {
   } catch (e) { fail(ul, e.message); }
 }
 
+// ── bank ide + editor ──────────────────────────────────────────────────
+// Yang disimpan adalah ide (topik + sudut + tautan bahan); teks artikel tidak
+// pernah masuk ke sini. Editor ada supaya menulis terjadi di satu tempat yang
+// sama dengan tempat idenya, bukan di chat.
+
+let editing = null; // ide yang sedang ditulis
+
+async function apiSend(path, method, body) {
+  const res = await fetch(BASE + path, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+  if (!res.ok) throw new Error((data && data.error) || res.status + ' ' + res.statusText);
+  return data;
+}
+
+function materialLine(idea) {
+  if (!idea.material_title && !idea.material_url) return '';
+  const t = esc(idea.material_title || 'bahan');
+  return idea.material_url
+    ? `bahan: <a href="${esc(idea.material_url)}" target="_blank" rel="noopener">${t}</a>`
+    : 'bahan: ' + t;
+}
+
+async function loadIdeas() {
+  const ul = $('ideas-list');
+  try {
+    const rows = await api('/api/ideas?status=new&limit=100');
+    if (!rows.length) return empty(ul, 'belum ada ide — jalankan "trends --bank" dulu');
+    ul.innerHTML = rows.map(i => `
+      <li><div class="top">
+        <span class="name">${esc(i.topic)}</span>
+        <span class="meta"><span class="pill">${esc(i.niche)}</span>${i.score ? '<span class="pill">' + Math.round(i.score) + '</span>' : ''}</span>
+      </div>
+      ${i.angle ? `<div class="body">${esc(i.angle)}</div>` : ''}
+      <div class="meta">${materialLine(i)}</div>
+      <div class="row" style="margin:8px 0 0">
+        <button class="act" data-write="${i.id}">Tulis</button>
+        <button class="act" data-skip="${i.id}">Buang</button>
+      </div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
+function openEditor(idea) {
+  editing = idea;
+  $('ide-editor').hidden = false;
+  $('ed-heading').textContent = 'Tulis: ' + idea.topic;
+  $('ed-topic').value = idea.topic || '';
+  $('ed-niche').value = ['teknologi', 'life', 'keuangan pribadi'].includes(idea.niche) ? idea.niche : 'teknologi';
+  $('ed-angle').textContent = idea.angle ? 'sudut: ' + idea.angle : '';
+  $('ed-material').innerHTML = materialLine(idea);
+  $('ed-hook').value = '';
+  $('ed-body').value = '';
+  $('ed-status').textContent = '';
+  countBody();
+  $('ed-body').focus();
+}
+
+// Threads menolak lebih dari 500 karakter per post, jadi draf panjang dipecah
+// di batas paragraf — bukan dipotong di tengah kalimat.
+const LIMIT = 500;
+function splitParts(text) {
+  const blocks = text.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  const parts = [];
+  for (const block of blocks) {
+    if (block.length <= LIMIT) { parts.push(block); continue; }
+    let buf = '';
+    for (const sentence of block.split(/(?<=[.!?])\s+/)) {
+      if ((buf + ' ' + sentence).trim().length > LIMIT && buf) { parts.push(buf.trim()); buf = sentence; }
+      else { buf = (buf ? buf + ' ' : '') + sentence; }
+      while (buf.length > LIMIT) { parts.push(buf.slice(0, LIMIT)); buf = buf.slice(LIMIT); }
+    }
+    if (buf.trim()) parts.push(buf.trim());
+  }
+  return parts.length ? parts : [text.trim()];
+}
+
+function countBody() {
+  const text = $('ed-body').value;
+  const parts = text.trim() ? splitParts(text) : [];
+  const over = parts.filter(p => p.length > LIMIT).length;
+  $('ed-count').textContent = text.trim()
+    ? `${text.length} karakter · ${parts.length} bagian` + (over ? ' (ada bagian kelebihan!)' : '') +
+      ' · ' + parts.map(p => p.length).join('/')
+    : '';
+}
+
+async function runPolish(mode) {
+  const text = ($('ed-hook').value.trim() ? $('ed-hook').value.trim() + '\n' : '') + $('ed-body').value;
+  if (!text.trim()) { $('ed-status').textContent = 'tulis dulu sesuatu'; return; }
+  $('ed-status').textContent = mode === 'hook' ? 'minta usulan hook…' : 'merapikan…';
+  try {
+    const out = await apiSend('/api/ideas/polish', 'POST',
+      { text, niche: $('ed-niche').value, mode });
+    if (mode === 'hook') {
+      $('ed-status').innerHTML = 'usulan hook: ' + (out.hooks || []).map(h =>
+        `<button class="act" data-hook="${esc(h)}">${esc(h)}</button>`).join(' ');
+      return;
+    }
+    const lines = (out.text || '').split('\n');
+    $('ed-hook').value = lines.length > 1 ? lines[0] : '';
+    $('ed-body').value = (lines.length > 1 ? lines.slice(1).join('\n') : out.text || '').trim();
+    countBody();
+    $('ed-status').textContent = 'sudah dirapikan — isinya tetap tulisanmu';
+  } catch (e) { $('ed-status').textContent = 'gagal: ' + e.message; }
+}
+
+async function saveDraft() {
+  const body = $('ed-body').value.trim();
+  if (!body) { $('ed-status').textContent = 'isi post masih kosong'; return; }
+  const parts = splitParts(($('ed-hook').value.trim() ? $('ed-hook').value.trim() + '\n' : '') + body);
+  $('ed-status').textContent = 'menyimpan…';
+  try {
+    const out = await apiSend('/api/drafts', 'POST', {
+      topic_id: editing ? editing.id : null,
+      niche: $('ed-niche').value,
+      topic: $('ed-topic').value.trim() || (editing ? editing.topic : ''),
+      hook: $('ed-hook').value.trim(),
+      body: parts[0],
+      parts,
+      material_title: editing ? (editing.material_title || '') : '',
+      material_url: editing ? (editing.material_url || '') : '',
+      platform: 'threads',
+    });
+    $('ed-status').textContent = 'tersimpan sebagai draf [' + out.id + '] — masuk antrean';
+    $('ide-editor').hidden = true;
+    editing = null;
+    loadIdeas(); loadDrafts();
+  } catch (e) { $('ed-status').textContent = 'gagal menyimpan: ' + e.message; }
+}
+
+async function loadDrafts() {
+  const ul = $('drafts-list');
+  try {
+    const rows = await api('/api/drafts?status=pending&limit=50');
+    if (!rows.length) return empty(ul, 'antrean kosong');
+    const mark = { approved: 'disetujui', published: 'terbit', rejected: 'ditolak' };
+    ul.innerHTML = rows.map(d => `
+      <li><div class="top">
+        <span class="name">${esc(d.topic)}</span>
+        <span class="meta"><span class="pill">${esc(d.niche)}</span>${mark[d.status] ? '<span class="pill">' + mark[d.status] + '</span>' : ''}</span>
+      </div>
+      <div class="body">${esc((d.parts || [d.body]).join('\n\n———\n\n'))}</div>
+      <div class="meta">${(d.parts || []).map(p => p.length).join('/')} karakter
+        ${d.material_url ? ' · <a href="' + esc(d.material_url) + '" target="_blank" rel="noopener">bahan</a>' : ''}</div>
+      <div class="row" style="margin:8px 0 0">
+        ${d.status === 'pending' ? `<button class="act" data-approve="${d.id}">Setujui</button>
+        <button class="act" data-reject="${d.id}">Tolak</button>` : ''}
+      </div></li>`).join('');
+  } catch (e) { fail(ul, e.message); }
+}
+
+$('ide-refresh').addEventListener('click', () => { loadIdeas(); loadDrafts(); });
+$('ed-body').addEventListener('input', countBody);
+$('ed-polish').addEventListener('click', () => runPolish(''));
+$('ed-hooks').addEventListener('click', () => runPolish('hook'));
+$('ed-save').addEventListener('click', saveDraft);
+$('ed-cancel').addEventListener('click', () => { $('ide-editor').hidden = true; editing = null; });
+
+$('ideas-list').addEventListener('click', async (e) => {
+  const write = e.target.closest('button[data-write]');
+  if (write) {
+    const idea = (await api('/api/ideas?status=new&limit=100')).find(i => String(i.id) === write.dataset.write);
+    if (idea) openEditor(idea);
+    return;
+  }
+  const skip = e.target.closest('button[data-skip]');
+  if (skip) {
+    try { await apiSend('/api/ideas/' + skip.dataset.skip, 'PATCH', { status: 'skipped' }); loadIdeas(); }
+    catch (err) { $('ed-status').textContent = 'gagal: ' + err.message; }
+  }
+});
+
+$('ed-status').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-hook]');
+  if (btn) { $('ed-hook').value = btn.dataset.hook; countBody(); }
+});
+
+$('drafts-list').addEventListener('click', async (e) => {
+  const approve = e.target.closest('button[data-approve]');
+  const reject = e.target.closest('button[data-reject]');
+  const id = (approve || reject) && (approve || reject).dataset[approve ? 'approve' : 'reject'];
+  if (!id) return;
+  try {
+    await apiSend('/api/drafts/' + id, 'PATCH', { status: approve ? 'approved' : 'rejected' });
+    loadDrafts();
+  } catch (err) { fail($('drafts-list'), err.message); }
+});
+
 function showTab(name) {
   const btn = document.querySelector('.tabs button[data-tab=' + name + ']');
   if (btn && btn.hidden) return; // feature not available for this member
@@ -405,6 +642,7 @@ function showTab(name) {
   if (name === 'transaksi') { loadTxns(); loadTransfers(); }
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
+  if (name === 'ide') { loadIdeas(); loadDrafts(); }
 }
 
 function showPocket(id) {
@@ -448,7 +686,9 @@ $('notes-list').addEventListener('click', async (e) => {
 });
 
 $('meal-day').value = new Date().toLocaleDateString('sv-SE'); // local YYYY-MM-DD
-$('stamp').textContent = 'read-only · ' + new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
+// the ledger stays read-only through this page; the Ide tab writes ideas and
+// drafts only, so the stamp says which half is which
+$('stamp').textContent = 'uang tetap baca-saja · ' + new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
 
 // ---- auth: Telegram signs who opened this page (no password needed) ----
 // Telegram opens a Mini App with the signed payload in the URL hash, so the
@@ -471,11 +711,11 @@ function afterLogin(w) {
   // a finance-scope member (his wife) has no notes or nutrition features yet, so
   // those tabs are not offered at all
   const financeOnly = w.scope === 'finance';
-  ['notes', 'meals'].forEach(t => {
+  ['notes', 'meals', 'ide'].forEach(t => {
     const btn = document.querySelector('.tabs button[data-tab=' + t + ']');
     if (btn) btn.hidden = financeOnly;
   });
-  if (financeOnly && /^#(notes|meals)$/.test(location.hash)) location.hash = '';
+  if (financeOnly && /^#(notes|meals|ide)$/.test(location.hash)) location.hash = '';
   showTab('ringkasan');
 }
 

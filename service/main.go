@@ -2301,6 +2301,9 @@ func allRoutes() []route {
 		{"POST", "/v1/content/runs", fullScope(createRun)},
 		{"GET", "/v1/content/runs", fullScope(listRuns)},
 		{"GET", "/v1/content/stats", fullScope(contentStats)},
+		// "rapikan dengan AI" from the editor: forwarded to the engine, which
+		// holds the model credentials and the voice prompts.
+		{"POST", "/v1/content/polish", fullScope(polishContent)},
 
 		{"POST", "/v1/admin/reset", withUser(resetData)},
 		{"GET", "/v1/admin/users", listUsers},

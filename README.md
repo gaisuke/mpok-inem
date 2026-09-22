@@ -139,9 +139,9 @@ database. It also guards the bugs found while writing it: a `tags`-less note
 POST used to violate NOT NULL, and a reset used to rewind a table's id sequence
 while other members still had rows (colliding ids on the next INSERT).
 
-## Read-only dashboard (inemdash)
+## Dashboard (inemdash) — read-only for the ledger
 
-`service/dashboard` serves one static page + a GET-only JSON passthrough to
+`service/dashboard` serves one static page + a JSON passthrough to
 inemd: ringkasan (period totals, category bars, pocket balances), transaksi,
 notes with search/tag filter, and meals with macros + daily target. Tapping a
 pocket opens that pocket's own ledger (`/api/pocket`, which merges the pocket,
@@ -154,8 +154,13 @@ password). `GET /api/whoami`, `POST /auth/telegram`, `POST /auth/password`
 (break-glass, only when configured) and `GET /auth/logout` are the only
 non-GET routes — none of them can reach inemd, so the data path stays read-only.
 
-- No write path exists in the binary — only GET routes are registered, so every
-  POST/PATCH/DELETE answers 405 and never reaches inemd.
+- **The ledger has no write path**: apart from the content routes below, only GET
+  routes are registered, so a stray POST/PATCH/DELETE answers 405 and never
+  reaches inemd. Nothing on the internet-facing page can move money.
+- The **Ide** tab is the one thing that writes: `POST /api/ideas/polish`,
+  `POST /api/drafts`, `PATCH /api/drafts/{id}`, `PATCH /api/ideas/{id}`. They touch
+  `content.*` only (ideas and drafts about posts), and they are listed one by one
+  on purpose — a generic write passthrough would delete that guarantee.
 - `INEM_WEB_ADDR` (default `127.0.0.1:8090`), `INEM_GATE_BASE`
   (default `http://127.0.0.1:8778`), `INEM_WEB_USER` + `INEM_WEB_AUTH_USER` /
   `INEM_WEB_AUTH_PASS` for the break-glass password. Deployed as
@@ -183,7 +188,14 @@ sudo -u postgres psql -c "CREATE DATABASE inem_test OWNER inem"   # tests
 ## Deployment notes
 
 - inemd binds to localhost only; never exposed directly. The dashboard is the
-  only off-box surface and it is read-only + basic auth over TLS.
+  only off-box surface: read-only for the ledger, basic auth over TLS, and the
+  only writes it can make are content ideas/drafts.
+- The content feature's LLM work lives in a separate process,
+  `~/viral-content-engine` (the "content engine", repo
+  `gaisuke/viral-content-engine`). inemd holds **no** model credential: it
+  forwards `POST /v1/content/polish` to the engine at `INEM_ENGINE_URL`
+  (default `http://127.0.0.1:8000`) and reports `502` with the service name when
+  the engine is down, so the editor never loses text silently.
 - Postgres is local-only with `trust` auth on `127.0.0.1` (see
   `docs/DECISIONS.md` for why: SCRAM handshake failed on this box while the
   stored verifier matched — a local-only trust line was the pragmatic fix).
