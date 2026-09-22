@@ -202,6 +202,7 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 		Source     string  `json:"source"`
 		Confidence float64 `json:"confidence"`
 		RawInput   string  `json:"raw_input"`
+		Date       string  `json:"date"` // optional YYYY-MM-DD: when it really happened
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -231,9 +232,14 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 	if in.Confidence > 0 {
 		conf = in.Confidence
 	}
-	err := db.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,confidence,raw_input)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-		userID, in.PocketID, in.Direction, in.Amount, in.Category, in.Note, in.Source, conf, in.RawInput).Scan(&id)
+	entryDate, msg := backdate(in.Date)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	err := db.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,confidence,raw_input,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::date, now())) RETURNING id`,
+		userID, in.PocketID, in.Direction, in.Amount, in.Category, in.Note, in.Source, conf, in.RawInput, entryDate).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -252,6 +258,7 @@ func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 		To     int    `json:"to_pocket_id"`
 		Amount int64  `json:"amount_idr"`
 		Note   string `json:"note"`
+		Date   string `json:"date"` // optional YYYY-MM-DD: when it really happened
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -277,8 +284,14 @@ func createTransfer(w http.ResponseWriter, r *http.Request, userID int) {
 		return
 	}
 	var id int
-	err = db.QueryRow(`INSERT INTO expense.transfers(user_id,from_pocket,to_pocket,amount,note) VALUES($1,$2,$3,$4,$5) RETURNING id`,
-		userID, in.From, in.To, in.Amount, in.Note).Scan(&id)
+	entryDate, msg := backdate(in.Date)
+	if msg != "" {
+		badReq(w, msg)
+		return
+	}
+	err = db.QueryRow(`INSERT INTO expense.transfers(user_id,from_pocket,to_pocket,amount,note,created_at)
+		VALUES($1,$2,$3,$4,$5,COALESCE($6::date, now())) RETURNING id`,
+		userID, in.From, in.To, in.Amount, in.Note, entryDate).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -757,6 +770,23 @@ func withUserID(next func(w http.ResponseWriter, r *http.Request, uid, id int)) 
 		}
 		next(w, r, uid, id)
 	}
+}
+
+// backdate validates an optional YYYY-MM-DD "when it really happened" and returns
+// it as a nullable SQL value: entries are often told the next morning ("last night
+// at 23:31"), and stamping the moment of typing would put them on the wrong day.
+// A future date is refused — the ledger records what happened, not what will.
+func backdate(date string) (any, string) {
+	if date == "" {
+		return nil, ""
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return nil, "date must be YYYY-MM-DD"
+	}
+	if date > time.Now().Format("2006-01-02") {
+		return nil, "date must not be in the future"
+	}
+	return date, ""
 }
 
 // dateParam reads one optional YYYY-MM-DD query parameter, defaulting to today.

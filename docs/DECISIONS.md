@@ -114,6 +114,27 @@ Consequences worth keeping:
 - Per-pocket sharing (`shared` vs `private`) is still to come; when it lands it
   must be read-only for non-owners and default to private.
 
+## D11 — Entries can be backdated to when they happened (2026-09-22)
+
+- **Problem.** Money is usually reported *after the fact*: "last night at 23:31 I
+  bought Ipan a data package, QRIS BRImo 1.200", typed the next morning. The ledger
+  stamped the moment of entry, so the entry landed on the wrong day and daily
+  reports shifted by one day. Schedules already had `entry_date`; manual entries
+  had nothing.
+- **Decision.** `POST /v1/transactions` and `POST /v1/transfers` accept an optional
+  `date` (`YYYY-MM-DD`), surfaced in the CLI as `spend --day` / `transfer --day`.
+  `created_at = COALESCE($n::date, now())`, so the default behaviour is untouched.
+- **Future dates are refused** (`400`), as is a loose format (`21-09-2026`): the
+  ledger records what happened, not what will. Guessing a date the user never
+  mentioned is worse than asking.
+- **Balance is independent of the date.** Only the day it is reported under changes;
+  money still leaves the pocket. Fixing a mis-dated entry is `txn-rm` + re-record
+  with `--day`, verified end to end on the Ipan entry.
+- **Rejected:** editing `created_at` in place (PATCH stays metadata-only — the
+  amount, pocket and direction remain immutable, and a date is part of *when*, not
+  *what*), and a free-form "yesterday" string on the API (the client resolves
+  relative words, the service only accepts a date).
+
 ## D6 — Pocket sharing is opt-in, read-only, and masks private counterparties (2026-09-20)
 
 `expense.pockets.visibility` is `private` by default; the owner shares a pocket

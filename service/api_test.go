@@ -1467,3 +1467,74 @@ func TestAuthHeaderAndCrossUserIsolation(t *testing.T) {
 		t.Fatalf("my empty pocket moved: %d", got)
 	}
 }
+
+// TestBackdatedEntries: money is often reported the next morning ("last night at
+// 23:31"), so an entry must be datable to when it really happened instead of the
+// moment it was typed. The date is validated: future dates are refused (the ledger
+// records what happened, not what will) and the format is strict.
+func TestBackdatedEntries(t *testing.T) {
+	a := newAPI(t)
+	p := int(a.obj("POST", "/v1/pockets",
+		map[string]any{"name": "Cash", "type": "cash", "opening_balance_idr": 100000}, 201)["id"].(float64))
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	today := time.Now().Format("2006-01-02")
+
+	out := a.obj("POST", "/v1/transactions", map[string]any{
+		"pocket_id": p, "direction": "out", "amount_idr": 1200,
+		"category": "communication", "note": "kuota buat Ipan",
+		"source": "manual", "date": yesterday}, 201)
+	id := int(out["id"].(float64))
+
+	var d time.Time
+	if err := a.conn.QueryRow(`SELECT created_at::date FROM expense.transactions WHERE id=$1`, id).Scan(&d); err != nil {
+		t.Fatalf("read created_at: %v", err)
+	}
+	if got := d.Format("2006-01-02"); got != yesterday {
+		t.Fatalf("created_at tersimpan %s, seharusnya %s", got, yesterday)
+	}
+	if got := len(a.list("GET", "/v1/transactions?from="+yesterday+"&to="+yesterday, 200)); got != 1 {
+		t.Fatalf("entri mundur tidak muncul di %s: %d entri", yesterday, got)
+	}
+	if got := len(a.list("GET", "/v1/transactions?from="+today+"&to="+today, 200)); got != 0 {
+		t.Fatalf("entri mundur bocor ke hari ini: %d entri", got)
+	}
+
+	// tanpa --day, perilaku lama tidak berubah: masuk hari ini
+	a.obj("POST", "/v1/transactions", map[string]any{
+		"pocket_id": p, "direction": "out", "amount_idr": 5000,
+		"category": "food", "note": "tanpa tanggal", "source": "manual"}, 201)
+	if got := len(a.list("GET", "/v1/transactions?from="+today+"&to="+today, 200)); got != 1 {
+		t.Fatalf("entri hari ini: %d, seharusnya 1", got)
+	}
+
+	// tanggal masa depan dan format longgar ditolak
+	for _, bad := range []string{time.Now().AddDate(0, 0, 1).Format("2006-01-02"), "21-09-2026", "2026-9-1"} {
+		if st, _ := a.call("POST", "/v1/transactions", map[string]any{
+			"pocket_id": p, "direction": "out", "amount_idr": 1000,
+			"source": "manual", "date": bad}); st != 400 {
+			t.Fatalf("tanggal %q harus ditolak, dapat status %d", bad, st)
+		}
+	}
+
+	// transfer juga bisa mundur, dan uangnya tetap pindah
+	dst := int(a.obj("POST", "/v1/pockets",
+		map[string]any{"name": "Jago", "type": "cash", "opening_balance_idr": 0}, 201)["id"].(float64))
+	tr := a.obj("POST", "/v1/transfers", map[string]any{
+		"from_pocket_id": p, "to_pocket_id": dst, "amount_idr": 10000,
+		"note": "tarik tunai", "date": yesterday}, 201)
+	if err := a.conn.QueryRow(`SELECT created_at::date FROM expense.transfers WHERE id=$1`,
+		int(tr["id"].(float64))).Scan(&d); err != nil {
+		t.Fatalf("read transfer created_at: %v", err)
+	}
+	if got := d.Format("2006-01-02"); got != yesterday {
+		t.Fatalf("transfer created_at %s, seharusnya %s", got, yesterday)
+	}
+	if got := a.balance(dst); got != 10000 {
+		t.Fatalf("saldo tujuan setelah transfer mundur: %d, seharusnya 10000", got)
+	}
+	if st, _ := a.call("POST", "/v1/transfers", map[string]any{
+		"from_pocket_id": p, "to_pocket_id": dst, "amount_idr": 1000,
+		"date": time.Now().AddDate(0, 0, 2).Format("2006-01-02")}); st != 400 {
+		t.Fatalf("transfer bertanggal masa depan harus ditolak, dapat %d", st)
+	}
+}
