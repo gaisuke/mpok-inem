@@ -247,8 +247,26 @@ const num = (n) => idr.format(n || 0);
 const esc = (s) => (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const $ = (id) => document.getElementById(id);
 
+// Break-glass password login: the password path sets no gate token — the server
+// re-checks the credentials on every request — so the browser has to send them
+// back itself. Without this the page reloads after a good login and looks
+// logged-out forever, with the overlay still up.
+const PW_KEY = 'inem-basic';
+function pwHeaders() {
+  try {
+    const raw = sessionStorage.getItem(PW_KEY);
+    return raw ? { Authorization: 'Basic ' + raw } : {};
+  } catch (e) { return {}; }
+}
+function setPW(user, pass) {
+  try { sessionStorage.setItem(PW_KEY, btoa(user + ':' + pass)); } catch (e) {}
+}
+function clearPW() {
+  try { sessionStorage.removeItem(PW_KEY); } catch (e) {}
+}
+
 async function api(path) {
-  const res = await fetch(BASE + path);
+  const res = await fetch(BASE + path, { headers: pwHeaders() });
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
@@ -447,7 +465,7 @@ let editing = null; // ide yang sedang ditulis
 
 async function apiSend(path, method, body) {
   const res = await fetch(BASE + path, {
-    method, headers: { 'Content-Type': 'application/json' },
+    method, headers: Object.assign({ 'Content-Type': 'application/json' }, pwHeaders()),
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -707,7 +725,9 @@ function showLogin(msg, passwordLogin) {
 
 function afterLogin(w) {
   $('login').hidden = true;
-  $('who').innerHTML = esc(w.display_name || '') + ' <a href="' + BASE + '/auth/logout">keluar</a>';
+  $('who').innerHTML = esc(w.display_name || '') + ' <a id="logout" href="' + BASE + '/auth/logout">keluar</a>';
+  const out = $('logout');
+  if (out) out.addEventListener('click', clearPW);
   // a finance-scope member (his wife) has no notes or nutrition features yet, so
   // those tabs are not offered at all
   const financeOnly = w.scope === 'finance';
@@ -737,6 +757,7 @@ async function boot() {
   let w = null;
   try { w = await api('/api/whoami'); } catch (e) { /* shown below */ }
   if (w && w.authenticated) return afterLogin(w);
+  clearPW(); // stale or wrong stored credentials: don't keep retrying them
   const initData = initDataFromHash();
   if (initData) return loginWithTelegram(initData);
   showLogin(w && w.password_login
@@ -755,6 +776,7 @@ $('login-form').addEventListener('submit', async (e) => {
       const out = await res.json().catch(() => ({}));
       return showLogin(out.error || 'Password salah', true);
     }
+    setPW($('login-user').value, $('login-pass').value);
     location.replace(location.pathname + location.search);
   } catch (err) {
     showLogin('Gagal masuk: ' + err.message, true);

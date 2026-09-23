@@ -104,7 +104,19 @@ func (s *server) handler() http.Handler {
 	})))
 	mux.HandleFunc("POST /api/drafts", s.authed(s.draftWrite))
 	mux.HandleFunc("PATCH /api/drafts/{id}", s.authed(s.draftUpdate))
-	return mux
+	return noCache(mux)
+}
+
+// noCache keeps the browser out of it: the page and every answer are per-request
+// state, and a cached copy is indistinguishable from a broken login — a stale
+// index.html ran old JavaScript, and a cached 401 for /api/whoami kept the login
+// overlay up even after the right password was accepted.
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func statusOr(r *http.Request, fallback string) string {
