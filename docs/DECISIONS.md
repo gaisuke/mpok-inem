@@ -263,3 +263,23 @@ Context: rent is paid monthly to a landlord and was agreed before it begins —
 Consequences: the Jadwal tab renders `X → bayar <payee>` with a `mulai <date>`
 pill (and `belum mulai` instead of `menunggu` before the start month), and the
 reminder cron names the payee.
+
+## D13 — A plan can end, and closes itself when its last month is booked (2026-09-26)
+
+Context: the monthly savings were raided to settle the rent, and October's salary
+is meant to put them back — a plan with a beginning and an end.
+
+- **`ends_on date`** is the mirror of `starts_on`. A month after the end reports
+  status `finished` and is excluded from the pending filter, so a one-off
+  replacement never asks for money in November.
+- **Booking the final month deactivates the plan** and says so (`finished: true`
+  in the run response). A temporary plan that keeps asking forever is noise, and
+  noise is how people learn to ignore reminders. The plan stays visible as
+  "sudah berakhir" instead of silently disappearing.
+- **Clearing `ends_on` reopens it** — "berhenti dulu" is not "hapus", and the
+  booked months stay booked either way.
+- **A window that ends before it starts is refused**, and `run` still refuses
+  future dates: money that has not moved yet is not an entry.
+
+Consequences: the savings replacement is plan [12] (1jt monthly savings keeps
+running as [2]).

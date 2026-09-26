@@ -1199,6 +1199,7 @@ type schedule struct {
 	Payee      string `json:"payee"`     // kind=expense: who is paid
 	Category   string `json:"category"`  // kind=expense: ledger category
 	StartsOn   string `json:"starts_on"` // empty = active from the beginning
+	EndsOn     string `json:"ends_on"`   // empty = runs every month, forever
 	Active     bool   `json:"active"`
 	Period     string `json:"period"`
 	DueDate    string `json:"due_date"`
@@ -1220,8 +1221,9 @@ WITH base AS (
 SELECT d.id, d.kind, d.from_pocket, COALESCE(pf.name,''), COALESCE(d.to_pocket,0)::int, COALESCE(pt.name,''),
   d.amount, (d.amount IS NULL), d.day_of_month, COALESCE(d.note,''), d.active,
   to_char($2::date,'YYYY-MM'), d.due_date::text,
-  COALESCE(d.payee,''), COALESCE(d.category,''), COALESCE(d.starts_on::text,''),
+  COALESCE(d.payee,''), COALESCE(d.category,''), COALESCE(d.starts_on::text,''), COALESCE(d.ends_on::text,''),
   CASE WHEN d.starts_on IS NOT NULL AND d.due_date < d.starts_on THEN 'not_started'
+       WHEN d.ends_on IS NOT NULL AND d.due_date > d.ends_on THEN 'finished'
        WHEN r.id IS NOT NULL THEN 'done'
        WHEN d.due_date = $2::date THEN 'due_today'
        WHEN d.due_date < $2::date THEN 'overdue'
@@ -1232,7 +1234,8 @@ LEFT JOIN expense.pockets pf ON pf.id=d.from_pocket
 LEFT JOIN expense.schedule_runs r ON r.schedule_id=d.id AND r.period=to_char($2::date,'YYYY-MM')
 WHERE ($3::bool IS NOT TRUE)
    OR (d.active AND r.id IS NULL AND d.due_date <= $2::date
-       AND (d.starts_on IS NULL OR d.due_date >= d.starts_on))
+       AND (d.starts_on IS NULL OR d.due_date >= d.starts_on)
+       AND (d.ends_on IS NULL OR d.due_date <= d.ends_on))
 ORDER BY d.eff_day, d.id`
 
 func scanSchedules(rows *sql.Rows) ([]schedule, error) {
@@ -1242,7 +1245,7 @@ func scanSchedules(rows *sql.Rows) ([]schedule, error) {
 		var from *int
 		if err := rows.Scan(&s.ID, &s.Kind, &from, &s.From, &s.ToPocket, &s.To,
 			&s.AmountIDR, &s.Variable, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate,
-			&s.Payee, &s.Category, &s.StartsOn, &s.Status); err != nil {
+			&s.Payee, &s.Category, &s.StartsOn, &s.EndsOn, &s.Status); err != nil {
 			return nil, err
 		}
 		s.FromPocket = from
@@ -1286,6 +1289,7 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		Payee      string `json:"payee"`
 		Category   string `json:"category"`
 		StartsOn   string `json:"starts_on"`
+		EndsOn     string `json:"ends_on"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1305,6 +1309,18 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		// the months before it starts
 		if _, err := time.Parse("2006-01-02", in.StartsOn); err != nil {
 			badReq(w, "starts_on must be YYYY-MM-DD")
+			return
+		}
+	}
+	if in.EndsOn != "" {
+		// and a temporary plan must stop: a replacement for one month is not a
+		// promise to keep moving that money forever
+		if _, err := time.Parse("2006-01-02", in.EndsOn); err != nil {
+			badReq(w, "ends_on must be YYYY-MM-DD")
+			return
+		}
+		if in.StartsOn != "" && in.EndsOn < in.StartsOn {
+			badReq(w, "ends_on must not be before starts_on")
 			return
 		}
 	}
@@ -1369,7 +1385,7 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 			return
 		}
 	}
-	var from, to, payee, category, startsOn any
+	var from, to, payee, category, startsOn, endsOn any
 	if in.Kind != "income" {
 		from = in.From
 	}
@@ -1385,10 +1401,13 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 	if in.StartsOn != "" {
 		startsOn = in.StartsOn
 	}
+	if in.EndsOn != "" {
+		endsOn = in.EndsOn
+	}
 	var id int64
-	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note,payee,category,starts_on)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date) RETURNING id`,
-		userID, in.Kind, from, to, in.Amount, in.DayOfMonth, in.Note, payee, category, startsOn).Scan(&id)
+	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note,payee,category,starts_on,ends_on)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11::date) RETURNING id`,
+		userID, in.Kind, from, to, in.Amount, in.DayOfMonth, in.Note, payee, category, startsOn, endsOn).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -1406,6 +1425,7 @@ func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 		Payee      *string `json:"payee"`
 		Category   *string `json:"category"`
 		StartsOn   *string `json:"starts_on"`
+		EndsOn     *string `json:"ends_on"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1466,8 +1486,20 @@ func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 			sets = append(sets, fmt.Sprintf("starts_on=$%d::date", len(args)))
 		}
 	}
+	if in.EndsOn != nil {
+		if *in.EndsOn == "" {
+			sets = append(sets, "ends_on=NULL")
+		} else {
+			if _, err := time.Parse("2006-01-02", *in.EndsOn); err != nil {
+				badReq(w, "ends_on must be YYYY-MM-DD")
+				return
+			}
+			args = append(args, *in.EndsOn)
+			sets = append(sets, fmt.Sprintf("ends_on=$%d::date", len(args)))
+		}
+	}
 	if len(sets) == 0 {
-		badReq(w, "nothing to update: send amount_idr, day_of_month, note, active, payee, category or starts_on")
+		badReq(w, "nothing to update: send amount_idr, day_of_month, note, active, payee, category, starts_on or ends_on")
 		return
 	}
 	res, err := db.Exec(`UPDATE expense.schedules SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
@@ -1676,6 +1708,16 @@ func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 		entry := map[string]any{"schedule_id": s.ID, "kind": s.Kind, "amount_idr": *amount,
 			"from": s.From, "to": s.To, "due_date": s.DueDate, "period": s.Period,
 			"entry_date": entryDate}
+		// A plan with an end date stops itself once its final month is booked: a
+		// temporary replacement that keeps asking forever becomes noise, and noise
+		// is how people learn to ignore reminders.
+		if s.EndsOn != "" && len(s.EndsOn) >= 7 && s.Period >= s.EndsOn[:7] {
+			if _, err := tx.Exec(`UPDATE expense.schedules SET active=false WHERE id=$1`, s.ID); err != nil {
+				badReq(w, err.Error())
+				return
+			}
+			entry["finished"] = true
+		}
 		if transferID != nil {
 			entry["transfer_id"] = transferID
 		}

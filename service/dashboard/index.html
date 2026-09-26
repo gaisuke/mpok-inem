@@ -401,7 +401,7 @@ async function loadSchedules() {
     const rows = await api('/api/schedules');
     if (!rows.length) return empty(ul, 'belum ada transfer terjadwal');
     const mark = { done: 'sudah dicatat', due_today: 'hari ini', overdue: 'terlambat',
-                   upcoming: 'menunggu', not_started: 'belum mulai' };
+                   upcoming: 'menunggu', not_started: 'belum mulai', finished: 'sudah berakhir' };
     ul.innerHTML = rows.map(s => {
       // An expense pays someone outside the household: it has a payee and no
       // destination pocket, so saying "X → " with an empty name would be a lie.
@@ -414,6 +414,7 @@ async function loadSchedules() {
       </div><div class="meta">tgl ${s.day_of_month} · ${esc(s.due_date)}
         · <span class="pill">${esc(mark[s.status] || s.status)}</span>
         ${s.starts_on ? `<span class="pill">mulai ${esc(s.starts_on)}</span>` : ''}
+        ${s.ends_on ? `<span class="pill">sampai ${esc(s.ends_on)}</span>` : ''}
         ${s.active ? '' : '<span class="pill">nonaktif</span>'}
         ${s.note ? ' · ' + esc(s.note) : ''}</div></li>`;
     }).join('');
