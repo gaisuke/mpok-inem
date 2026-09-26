@@ -239,3 +239,27 @@ explicitly. The rules that keep this from leaking:
   Any element hidden via the attribute now carries an explicit `[hidden]` rule,
   and verification checks the *computed* style — the earlier check read the
   attribute and passed while the overlay covered the page.
+
+## D12 — A recurring plan can pay someone outside the household, and can start later (2026-09-26)
+
+Context: rent is paid monthly to a landlord and was agreed before it begins —
+"1,8jt tiap tgl 2, tapi skip Oktober, langsung November".
+
+- **`kind='expense'`, with a `payee` and no destination pocket.** A transfer moves
+  money inside the ledger; an expense leaves it. Modelling rent as a transfer to a
+  fake pocket would put a pocket in the books that holds nothing and receives
+  nothing, and every balance would then need an explanation.
+- **Booking an expense writes an ordinary transaction** (source `scheduled`) from
+  the pocket that pays, so the balance maths still has exactly one implementation.
+- **`starts_on date` marks when a plan begins.** A month before the start reports
+  status `not_started`, and the pending filter — the one the reminder asks about —
+  excludes it, so a November plan stays quiet all through October. Clearing
+  `starts_on` re-enables the plan for every month.
+- **The payee is required** by the endpoint and by a CHECK constraint: a reminder
+  that asks "sudah dibayar?" without naming who gets the money is not actionable.
+- **The paying pocket must be the planner's own**, and an expense that carries a
+  destination pocket is refused rather than silently reinterpreted.
+
+Consequences: the Jadwal tab renders `X → bayar <payee>` with a `mulai <date>`
+pill (and `belum mulai` instead of `menunggu` before the start month), and the
+reminder cron names the payee.

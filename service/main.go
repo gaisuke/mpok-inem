@@ -1187,7 +1187,7 @@ func deleteTransfer(w http.ResponseWriter, r *http.Request, userID, id int) {
 
 type schedule struct {
 	ID         int64  `json:"id"`
-	Kind       string `json:"kind"`
+	Kind       string `json:"kind"` // transfer | income | expense
 	FromPocket *int   `json:"from_pocket_id"`
 	From       string `json:"from"`
 	ToPocket   int    `json:"to_pocket_id"`
@@ -1196,10 +1196,13 @@ type schedule struct {
 	Variable   bool   `json:"variable"`
 	DayOfMonth int    `json:"day_of_month"`
 	Note       string `json:"note"`
+	Payee      string `json:"payee"`     // kind=expense: who is paid
+	Category   string `json:"category"`  // kind=expense: ledger category
+	StartsOn   string `json:"starts_on"` // empty = active from the beginning
 	Active     bool   `json:"active"`
 	Period     string `json:"period"`
 	DueDate    string `json:"due_date"`
-	Status     string `json:"status"`
+	Status     string `json:"status"` // not_started | done | due_today | overdue | upcoming
 }
 
 // scheduleSQL computes, for one date, when each plan lands this month and whether
@@ -1214,19 +1217,22 @@ WITH base AS (
   SELECT b.*, (date_trunc('month',$2::date)::date + (b.eff_day - 1)) AS due_date
   FROM base b
 )
-SELECT d.id, d.kind, d.from_pocket, COALESCE(pf.name,''), d.to_pocket, pt.name,
+SELECT d.id, d.kind, d.from_pocket, COALESCE(pf.name,''), COALESCE(d.to_pocket,0)::int, COALESCE(pt.name,''),
   d.amount, (d.amount IS NULL), d.day_of_month, COALESCE(d.note,''), d.active,
   to_char($2::date,'YYYY-MM'), d.due_date::text,
-  CASE WHEN r.id IS NOT NULL THEN 'done'
+  COALESCE(d.payee,''), COALESCE(d.category,''), COALESCE(d.starts_on::text,''),
+  CASE WHEN d.starts_on IS NOT NULL AND d.due_date < d.starts_on THEN 'not_started'
+       WHEN r.id IS NOT NULL THEN 'done'
        WHEN d.due_date = $2::date THEN 'due_today'
        WHEN d.due_date < $2::date THEN 'overdue'
        ELSE 'upcoming' END
 FROM dated d
-JOIN expense.pockets pt ON pt.id=d.to_pocket
+LEFT JOIN expense.pockets pt ON pt.id=d.to_pocket
 LEFT JOIN expense.pockets pf ON pf.id=d.from_pocket
 LEFT JOIN expense.schedule_runs r ON r.schedule_id=d.id AND r.period=to_char($2::date,'YYYY-MM')
 WHERE ($3::bool IS NOT TRUE)
-   OR (d.active AND r.id IS NULL AND d.due_date <= $2::date)
+   OR (d.active AND r.id IS NULL AND d.due_date <= $2::date
+       AND (d.starts_on IS NULL OR d.due_date >= d.starts_on))
 ORDER BY d.eff_day, d.id`
 
 func scanSchedules(rows *sql.Rows) ([]schedule, error) {
@@ -1235,7 +1241,8 @@ func scanSchedules(rows *sql.Rows) ([]schedule, error) {
 		var s schedule
 		var from *int
 		if err := rows.Scan(&s.ID, &s.Kind, &from, &s.From, &s.ToPocket, &s.To,
-			&s.AmountIDR, &s.Variable, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate, &s.Status); err != nil {
+			&s.AmountIDR, &s.Variable, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate,
+			&s.Payee, &s.Category, &s.StartsOn, &s.Status); err != nil {
 			return nil, err
 		}
 		s.FromPocket = from
@@ -1276,6 +1283,9 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		Amount     *int64 `json:"amount_idr"`
 		DayOfMonth int    `json:"day_of_month"`
 		Note       string `json:"note"`
+		Payee      string `json:"payee"`
+		Category   string `json:"category"`
+		StartsOn   string `json:"starts_on"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1284,9 +1294,19 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 	if in.Kind == "" {
 		in.Kind = "transfer"
 	}
-	if in.Kind != "transfer" && in.Kind != "income" {
-		badReq(w, "kind must be transfer|income")
+	switch in.Kind {
+	case "transfer", "income", "expense":
+	default:
+		badReq(w, "kind must be transfer|income|expense")
 		return
+	}
+	if in.StartsOn != "" {
+		// a plan agreed before it begins (rent from November) must not ask about
+		// the months before it starts
+		if _, err := time.Parse("2006-01-02", in.StartsOn); err != nil {
+			badReq(w, "starts_on must be YYYY-MM-DD")
+			return
+		}
 	}
 	if in.Amount != nil && *in.Amount <= 0 {
 		badReq(w, "amount_idr must be > 0")
@@ -1296,7 +1316,25 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, "day_of_month must be 1..31")
 		return
 	}
-	if in.To == 0 {
+	if in.Kind == "expense" {
+		// An expense leaves the household: there is no destination pocket to move
+		// money into, and the payee is what makes the reminder actionable.
+		if in.To != 0 {
+			badReq(w, "an expense has no destination pocket — name the payee instead")
+			return
+		}
+		if strings.TrimSpace(in.Payee) == "" {
+			badReq(w, "payee required for an expense: who is being paid?")
+			return
+		}
+		if in.From == 0 {
+			badReq(w, "from_pocket_id required: which pocket pays?")
+			return
+		}
+		if strings.TrimSpace(in.Category) == "" {
+			in.Category = "lainnya"
+		}
+	} else if in.To == 0 {
 		badReq(w, "to_pocket_id required")
 		return
 	}
@@ -1309,34 +1347,48 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 	// The source must be the planner's own pocket (nobody plans someone else's
 	// spending); the destination may be another member's pocket as long as the
 	// planner can see it — the "send my wife money every month" case.
-	if in.Kind == "transfer" {
-		var own int
-		if err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, in.From, userID).Scan(&own); err != nil {
-			badReq(w, "source pocket not found for user")
-			return
-		}
-	} else {
+	if in.Kind == "income" {
 		var own int
 		if err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, in.To, userID).Scan(&own); err != nil {
 			badReq(w, "destination pocket not found for user")
 			return
 		}
+	} else {
+		var own int
+		if err := db.QueryRow(`SELECT 1 FROM expense.pockets WHERE id=$1 AND user_id=$2`, in.From, userID).Scan(&own); err != nil {
+			badReq(w, "source pocket not found for user")
+			return
+		}
 	}
-	if visible, err := pocketVisibleTo(userID, in.To); err != nil {
-		badReq(w, err.Error())
-		return
-	} else if !visible {
-		badReq(w, "destination pocket not found")
-		return
+	if in.To != 0 {
+		if visible, err := pocketVisibleTo(userID, in.To); err != nil {
+			badReq(w, err.Error())
+			return
+		} else if !visible {
+			badReq(w, "destination pocket not found")
+			return
+		}
 	}
-	var from any
-	if in.Kind == "transfer" {
+	var from, to, payee, category, startsOn any
+	if in.Kind != "income" {
 		from = in.From
 	}
+	if in.Kind != "expense" {
+		to = in.To
+	}
+	if in.Payee != "" {
+		payee = in.Payee
+	}
+	if in.Category != "" {
+		category = in.Category
+	}
+	if in.StartsOn != "" {
+		startsOn = in.StartsOn
+	}
 	var id int64
-	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note)
-		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-		userID, in.Kind, from, in.To, in.Amount, in.DayOfMonth, in.Note).Scan(&id)
+	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note,payee,category,starts_on)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date) RETURNING id`,
+		userID, in.Kind, from, to, in.Amount, in.DayOfMonth, in.Note, payee, category, startsOn).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -1351,6 +1403,9 @@ func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 		DayOfMonth *int    `json:"day_of_month"`
 		Note       *string `json:"note"`
 		Active     *bool   `json:"active"`
+		Payee      *string `json:"payee"`
+		Category   *string `json:"category"`
+		StartsOn   *string `json:"starts_on"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1386,8 +1441,33 @@ func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 		args = append(args, *in.Active)
 		sets = append(sets, fmt.Sprintf("active=$%d", len(args)))
 	}
+	if in.Payee != nil {
+		if strings.TrimSpace(*in.Payee) == "" {
+			badReq(w, "payee must not be empty")
+			return
+		}
+		args = append(args, *in.Payee)
+		sets = append(sets, fmt.Sprintf("payee=$%d", len(args)))
+	}
+	if in.Category != nil {
+		args = append(args, *in.Category)
+		sets = append(sets, fmt.Sprintf("category=$%d", len(args)))
+	}
+	if in.StartsOn != nil {
+		// an empty value clears the start: the plan applies to every month
+		if *in.StartsOn == "" {
+			sets = append(sets, "starts_on=NULL")
+		} else {
+			if _, err := time.Parse("2006-01-02", *in.StartsOn); err != nil {
+				badReq(w, "starts_on must be YYYY-MM-DD")
+				return
+			}
+			args = append(args, *in.StartsOn)
+			sets = append(sets, fmt.Sprintf("starts_on=$%d::date", len(args)))
+		}
+	}
 	if len(sets) == 0 {
-		badReq(w, "nothing to update: send amount_idr, day_of_month, note or active")
+		badReq(w, "nothing to update: send amount_idr, day_of_month, note, active, payee, category or starts_on")
 		return
 	}
 	res, err := db.Exec(`UPDATE expense.schedules SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
@@ -1550,13 +1630,33 @@ func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 			entryDate = in.EntryDate
 		}
 		var transferID, txnID any
-		if s.Kind == "income" {
+		switch s.Kind {
+		case "income":
 			var id int64
 			err = tx.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,created_at)
 				VALUES($1,$2,'in',$3,'gaji',$4,'scheduled',$5::date) RETURNING id`,
 				userID, s.ToPocket, *amount, note, entryDate).Scan(&id)
 			txnID = id
-		} else {
+		case "expense":
+			// Money leaving the household: a normal transaction, from the pocket
+			// that pays. The payee is kept on the entry so the ledger explains
+			// itself a month later.
+			category := s.Category
+			if category == "" {
+				category = "lainnya"
+			}
+			noteText := note
+			if strings.TrimSpace(noteText) == "" {
+				noteText = s.Payee
+			} else if s.Payee != "" && !strings.Contains(strings.ToLower(noteText), strings.ToLower(s.Payee)) {
+				noteText = noteText + " — " + s.Payee
+			}
+			var id int64
+			err = tx.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,created_at)
+				VALUES($1,$2,'out',$3,$4,$5,'scheduled',$6::date) RETURNING id`,
+				userID, *s.FromPocket, *amount, category, noteText, entryDate).Scan(&id)
+			txnID = id
+		default:
 			var id int64
 			err = tx.QueryRow(`INSERT INTO expense.transfers(user_id,from_pocket,to_pocket,amount,note,created_at)
 				VALUES($1,$2,$3,$4,$5,$6::date) RETURNING id`,
@@ -1608,7 +1708,8 @@ func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 func affectedPockets(ran []map[string]any, all []schedule) []int {
 	out := []int{}
 	for _, e := range ran {
-		if e["kind"] != "transfer" {
+		// Both a transfer and an expense can overdraw the pocket they leave.
+		if e["kind"] != "transfer" && e["kind"] != "expense" {
 			continue
 		}
 		id := int(e["schedule_id"].(int64))
