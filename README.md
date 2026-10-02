@@ -76,9 +76,9 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | GET | `/v1/pockets/{id}` | one pocket with its balance (own, or shared with you) |
 | PATCH/DELETE | `/v1/pockets/{id}` | rename/retype/share a pocket; delete an empty one |
 | GET | `/v1/household` | every member's *shared* pockets + household total |
-| POST | `/v1/transactions` | record a transaction |
+| POST | `/v1/transactions` | record a transaction (`visibility: secret` hides this one entry from every other member) |
 | GET | `/v1/transactions` | transaction detail (`from`, `to`, `category`, `direction`, `pocket_id`, `limit`) |
-| GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, or drop a mistaken entry |
+| GET/PATCH/DELETE | `/v1/transactions/{id}` | fetch, fix note/category, mark secret or back to normal, or drop a mistaken entry |
 | POST | `/v1/transfers` | move money between pockets (`from_pocket_id`, `to_pocket_id`, `amount_idr`, `note`); destination may be another member's shared pocket |
 | GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `pocket_id`, `limit`) — includes moves into/out of your pockets made by the other member |
 | DELETE | `/v1/transfers/{id}` | drop a mistaken transfer |
@@ -115,6 +115,11 @@ but every write stays scoped to the owner (`POST /v1/transactions`,
 - A shared pocket's ledger is complete — the balance must still add up — but a
   counterparty pocket the reader may not see is masked as `(pribadi)` in
   `GET /v1/transfers`, so a private pocket's name never leaks.
+- **One exception, deliberate: an entry marked `visibility: secret`.** A partner
+  reading the ledger simply does not get that line — no note, no amount — while
+  the pocket balance still counts it, because the money really did leave. It
+  exists so a surprise (a gift) is not spoiled by the bookkeeping, and it is a
+  property of the *entry*, never of the pocket.
 - `/v1/household` returns only shared pockets, grouped per member, plus the total.
 - Private pockets are invisible in every read path (`404` / `403`), including the
   household view.

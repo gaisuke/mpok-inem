@@ -203,6 +203,10 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 		Confidence float64 `json:"confidence"`
 		RawInput   string  `json:"raw_input"`
 		Date       string  `json:"date"` // optional YYYY-MM-DD: when it really happened
+		// Visibility 'secret' keeps this one entry out of everyone else's view
+		// (see the visibility column): the owner still sees it, the household
+		// still sees the money gone from the balance, nobody else sees the line.
+		Visibility string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -214,6 +218,13 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 	}
 	if in.Amount <= 0 {
 		badReq(w, "amount_idr must be > 0")
+		return
+	}
+	if in.Visibility == "" {
+		in.Visibility = "normal"
+	}
+	if in.Visibility != "normal" && in.Visibility != "secret" {
+		badReq(w, "visibility must be normal|secret")
 		return
 	}
 	if in.Source == "" {
@@ -237,9 +248,9 @@ func createTxn(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, msg)
 		return
 	}
-	err := db.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,confidence,raw_input,created_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::date, now())) RETURNING id`,
-		userID, in.PocketID, in.Direction, in.Amount, in.Category, in.Note, in.Source, conf, in.RawInput, entryDate).Scan(&id)
+	err := db.QueryRow(`INSERT INTO expense.transactions(user_id,pocket_id,direction,amount,category,note,source,confidence,raw_input,visibility,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE($11::date, now())) RETURNING id`,
+		userID, in.PocketID, in.Direction, in.Amount, in.Category, in.Note, in.Source, conf, in.RawInput, in.Visibility, entryDate).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -460,6 +471,12 @@ func listTxns(w http.ResponseWriter, r *http.Request, userID int) {
 		args = append(args, d)
 		where += fmt.Sprintf(" AND t.direction=$%d", len(args))
 	}
+	// A 'secret' entry never leaves its owner's view — not even through a
+	// shared pocket, which is otherwise meant to be readable. The pocket
+	// balance still counts it (the money really moved), so the household sees
+	// "some money is gone" without seeing what it bought.
+	args = append(args, userID)
+	where += fmt.Sprintf(" AND (t.visibility='normal' OR t.user_id=$%d)", len(args))
 	args = append(args, limit)
 	rows, err := db.Query(fmt.Sprintf(txnSelect+` WHERE %s ORDER BY t.id DESC LIMIT $%d`, where, len(args)), args...)
 	if err != nil {
@@ -960,25 +977,26 @@ func deletePocket(w http.ResponseWriter, r *http.Request, userID, id int) {
 }
 
 type txn struct {
-	ID        int64  `json:"id"`
-	PocketID  int    `json:"pocket_id"`
-	Pocket    string `json:"pocket"`
-	Direction string `json:"direction"`
-	AmountIDR int64  `json:"amount_idr"`
-	Category  string `json:"category"`
-	Note      string `json:"note"`
-	Source    string `json:"source"`
-	CreatedAt string `json:"created_at"`
+	ID         int64  `json:"id"`
+	PocketID   int    `json:"pocket_id"`
+	Pocket     string `json:"pocket"`
+	Direction  string `json:"direction"`
+	AmountIDR  int64  `json:"amount_idr"`
+	Category   string `json:"category"`
+	Note       string `json:"note"`
+	Source     string `json:"source"`
+	Visibility string `json:"visibility"`
+	CreatedAt  string `json:"created_at"`
 }
 
 const txnSelect = `SELECT t.id, t.pocket_id, p.name, t.direction, t.amount, t.category,
-	COALESCE(t.note,''), t.source, t.created_at
+	COALESCE(t.note,''), t.source, t.visibility, t.created_at
 	FROM expense.transactions t JOIN expense.pockets p ON p.id=t.pocket_id`
 
 func scanTxn(s interface{ Scan(...any) error }) (txn, error) {
 	var t txn
 	var ts time.Time
-	err := s.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &t.Source, &ts)
+	err := s.Scan(&t.ID, &t.PocketID, &t.Pocket, &t.Direction, &t.AmountIDR, &t.Category, &t.Note, &t.Source, &t.Visibility, &ts)
 	t.CreatedAt = ts.Format(time.RFC3339)
 	return t, err
 }
@@ -996,20 +1014,22 @@ func fetchTxn(w http.ResponseWriter, userID, id int) (txn, bool) {
 	return t, true
 }
 
-// updateTxn: metadata only (note, category). Amounts, pocket and direction stay
-// immutable so a pocket balance can never silently drift from the bank app;
-// a wrong amount is corrected with a compensating entry.
+// updateTxn: metadata only (note, category, and whether the entry is secret).
+// Amounts, pocket and direction stay immutable so a pocket balance can never
+// silently drift from the bank app; a wrong amount is corrected with a
+// compensating entry.
 func updateTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
 	var in struct {
-		Note     *string `json:"note"`
-		Category *string `json:"category"`
+		Note       *string `json:"note"`
+		Category   *string `json:"category"`
+		Visibility *string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
 		return
 	}
-	if in.Note == nil && in.Category == nil {
-		badReq(w, "nothing to update: send note or category")
+	if in.Note == nil && in.Category == nil && in.Visibility == nil {
+		badReq(w, "nothing to update: send note, category or visibility")
 		return
 	}
 	sets := []string{}
@@ -1025,6 +1045,14 @@ func updateTxn(w http.ResponseWriter, r *http.Request, userID, id int) {
 		}
 		args = append(args, *in.Category)
 		sets = append(sets, fmt.Sprintf("category=$%d", len(args)))
+	}
+	if in.Visibility != nil {
+		if *in.Visibility != "normal" && *in.Visibility != "secret" {
+			badReq(w, "visibility must be normal|secret")
+			return
+		}
+		args = append(args, *in.Visibility)
+		sets = append(sets, fmt.Sprintf("visibility=$%d", len(args)))
 	}
 	res, err := db.Exec(`UPDATE expense.transactions SET `+strings.Join(sets, ", ")+` WHERE user_id=$1 AND id=$2`, args...)
 	if err != nil {

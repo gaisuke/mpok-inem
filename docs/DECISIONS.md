@@ -283,3 +283,32 @@ is meant to put them back — a plan with a beginning and an end.
 
 Consequences: the savings replacement is plan [12] (1jt monthly savings keeps
 running as [2]).
+
+## D14 — One entry can be secret, and only its owner sees it (2026-10-03)
+
+Context: an anniversary gift (hairdryer, Rp135.203) was booked into BRImo, the
+pocket Pipit can read. Pocket sharing is the whole point of the household view,
+and it would have handed her the note — "kado anniversary: hairdryer buat
+istri" — plus the amount. Relabelling the note is a band-aid: the category alone
+("hadiah") already gives it away.
+
+- **`expense.transactions.visibility`** is `normal` (the default) or `secret`. It
+  is a property of the *entry*, never of the pocket: hiding a whole pocket would
+  mean lying about where the money lives, which is worse than the leak.
+- **A secret line never leaves its owner's view.** The ledger read that serves a
+  shared pocket filters `visibility='normal' OR user_id=<caller>`, so a partner's
+  read of that pocket is simply missing the line — no note, no amount, not even
+  a placeholder that hints at one.
+- **The balance stays truthful.** The pocket still counts the secret entry, so
+  the household sees that money left (it really did) without seeing what it
+  bought. Masking the balance too would corrupt the one number everyone trusts.
+- **Fetch-by-id and updates stay owner-scoped** (they always were), so a secret
+  entry can be neither read nor touched by anyone else.
+- **`--secret` on `spend`, `--secret` / `--normal` on `txn-edit`.** The owner's
+  own view marks it with a lock, because the failure mode of a secret is
+  forgetting to un-secret it after the surprise.
+
+Consequences: hide-then-restore is two commands and both are reversible; the
+surprise entry stays in the books, so no month is ever missing money. Transfers
+are not covered yet — a surprise that is a *move* between pockets would still be
+visible.
