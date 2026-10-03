@@ -312,3 +312,32 @@ Consequences: hide-then-restore is two commands and both are reversible; the
 surprise entry stays in the books, so no month is ever missing money. Transfers
 are not covered yet — a surprise that is a *move* between pockets would still be
 visible.
+
+## D15 — Privacy mode: money is hidden before it leaves the server (2026-10-03)
+
+Context: the dashboard was about to appear on a TikTok live. Balances and
+per-category totals on screen are the household's business, and one frame on
+stream (or a screenshot) would have published them.
+
+- **The masking happens inside inemdash, on the way out** — in `writeJSON` and in
+  the passthrough that forwards inemd's body. A hidden figure never reaches the
+  browser, so neither the page source nor dev tools can reveal it. Masking in the
+  page would have left every number one dev-tools panel away from the audience.
+- **The rule is structural, not a list**: every money field in this API ends in
+  `_idr`, so those values become `null` and the page draws `••••••`. Names,
+  categories and note text still render, so the screen still looks like the
+  product rather than an empty page.
+- **Balances are hidden too, and that is the difference from D14.** There the
+  problem was a partner reading a shared pocket, and the balance had to stay
+  truthful. Here the audience is the problem: on a live, "Rp21jt" is the
+  sensitive fact, not which pocket holds it.
+- **The switch is a route** (`GET/POST /api/privacy`, behind the normal login) and
+  its state lives in the service's `StateDirectory`, so a restart in the middle of
+  a live cannot un-hide the page. `INEM_DASH_PRIVACY=1` forces it on at boot.
+- **Note text is left alone.** A note that spells out an amount ("sisakan 1,4jt")
+  stays readable: masking free text would gut the page, so the trade-off is
+  written down instead of quietly taken.
+
+Consequences: one click before going live, one click after. Two tests pin it —
+the passthrough and the pocket-detail merge, which builds its own JSON and would
+otherwise have missed the mask.

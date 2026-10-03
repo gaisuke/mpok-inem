@@ -17,6 +17,10 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+# Tempat menyimpan status mode privasi (disembunyikan / tidak). Tanpa ini,
+# sebuah live yang sedang berjalan akan kembali menampilkan saldo asli begitu
+# servicenya restart di tengah siaran.
+StateDirectory=inemdash
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectControlGroups=true

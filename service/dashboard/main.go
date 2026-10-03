@@ -22,9 +22,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +60,8 @@ func (s *server) handler() http.Handler {
 	// whoami answers for everyone: the page uses it to decide between the app
 	// and the login screen.
 	mux.HandleFunc("GET /api/whoami", s.whoami)
+	mux.HandleFunc("GET /api/privacy", s.authed(s.privacyGet))
+	mux.HandleFunc("POST /api/privacy", s.authed(s.privacySet))
 
 	mux.HandleFunc("GET /api/pockets", s.authed(s.pass("/v1/pockets", nil)))
 	mux.HandleFunc("GET /api/summary", s.authed(s.pass("/v1/expense/summary", periodQuery)))
@@ -303,6 +307,29 @@ func (s *server) authTelegram(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"user_id": out.UserID, "display_name": out.DisplayName})
 }
 
+// privacyGet lets the page draw the right state on load; privacySet is the
+// switch itself. Both are behind the normal login, so nobody else can flip it.
+func (s *server) privacyGet(w http.ResponseWriter, r *http.Request, _ identity) {
+	writeJSON(w, http.StatusOK, map[string]any{"on": privacyEnabled()})
+}
+
+func (s *server) privacySet(w http.ResponseWriter, r *http.Request, _ identity) {
+	var in struct {
+		On *bool `json:"on"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&in); err != nil || in.On == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": `body must be {"on": true|false}`})
+		return
+	}
+	setPrivacy(*in.On)
+	if *in.On {
+		log.Printf("privacy mode ON — rupiah figures are hidden from every response")
+	} else {
+		log.Printf("privacy mode off — figures are served again")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"on": privacyEnabled()})
+}
+
 // authPassword is the break-glass path: only active when a password is set.
 func (s *server) authPassword(w http.ResponseWriter, r *http.Request) {
 	if s.passwd == "" {
@@ -415,6 +442,9 @@ func (s *server) forward(w http.ResponseWriter, r *http.Request, target string, 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	if privacyEnabled() {
+		body = maskBody(body)
+	}
 	_, _ = w.Write(body)
 }
 
@@ -605,6 +635,12 @@ func (s *server) pocketDetail(w http.ResponseWriter, r *http.Request, id identit
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	if privacyEnabled() {
+		if raw, err := json.Marshal(v); err == nil {
+			_, _ = w.Write(maskBody(raw))
+			return
+		}
+	}
 	_ = json.NewEncoder(w).Encode(v)
 }
 
@@ -700,6 +736,83 @@ func monday(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location()).AddDate(0, 0, -offset)
 }
 
+// ---------- privacy mode ----------
+//
+// A TikTok live — or any screenshot — is not a place for the household's
+// balances, so the dashboard can hide every rupiah figure. The masking happens
+// on the way out, inside this process: a hidden number never reaches the
+// browser, so nothing in the page source or its dev tools can give it away.
+var (
+	privacyOn   atomic.Bool
+	privacyFile string
+)
+
+func privacyEnabled() bool { return privacyOn.Load() }
+
+// setPrivacy flips the mode and remembers it on disk, so a forgotten toggle
+// cannot un-hide the page in the middle of a live stream.
+func setPrivacy(on bool) {
+	privacyOn.Store(on)
+	if privacyFile == "" {
+		return
+	}
+	if on {
+		_ = os.WriteFile(privacyFile, []byte("on\n"), 0o600)
+		return
+	}
+	_ = os.Remove(privacyFile)
+}
+
+// readPrivacyState restores the toggle after a restart: the env flag wins, then
+// the state file.
+func readPrivacyState(path, flag string) bool {
+	switch strings.ToLower(strings.TrimSpace(flag)) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// maskMoney blanks every rupiah figure in a decoded JSON body. All money fields
+// in this API end in `_idr`, so the rule needs no list that could drift.
+func maskMoney(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if strings.HasSuffix(k, "_idr") {
+				t[k] = nil
+				continue
+			}
+			t[k] = maskMoney(val)
+		}
+		return t
+	case []any:
+		for i, val := range t {
+			t[i] = maskMoney(val)
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+// maskBody applies that rule to a raw JSON response.
+func maskBody(body []byte) []byte {
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
+		return body
+	}
+	out, err := json.Marshal(maskMoney(v))
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -716,6 +829,13 @@ func main() {
 		passwd:   os.Getenv("INEM_WEB_AUTH_PASS"),
 		client:   &http.Client{Timeout: 15 * time.Second},
 		slow:     &http.Client{Timeout: 120 * time.Second},
+	}
+	if dir := os.Getenv("STATE_DIRECTORY"); dir != "" {
+		privacyFile = filepath.Join(dir, "privacy")
+	}
+	privacyOn.Store(readPrivacyState(privacyFile, os.Getenv("INEM_DASH_PRIVACY")))
+	if privacyEnabled() {
+		log.Printf("privacy mode is ON: every rupiah figure is hidden before it leaves this process")
 	}
 	addr := env("INEM_WEB_ADDR", "127.0.0.1:8090")
 	if s.passwd == "" {

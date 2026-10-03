@@ -162,6 +162,12 @@ non-GET routes — none of them can reach inemd, so the data path stays read-onl
 - **The ledger has no write path**: apart from the content routes below, only GET
   routes are registered, so a stray POST/PATCH/DELETE answers 405 and never
   reaches inemd. Nothing on the internet-facing page can move money.
+- **Mode privasi** (`GET/POST /api/privacy`, or `INEM_DASH_PRIVACY=1` to force it
+  on): every rupiah figure is blanked **before it leaves this process** — the
+  passthrough and `writeJSON` turn each `*_idr` value into `null`, and the page
+  draws `••••••`. The switch survives a restart (systemd `StateDirectory`), so a
+  crash mid-live cannot un-hide the screen. Names, categories and note text are
+  untouched — only money is hidden.
 - The **Ide** tab is the one thing that writes: `POST /api/ideas/polish`,
   `POST /api/drafts`, `PATCH /api/drafts/{id}`, `PATCH /api/ideas/{id}`. They touch
   `content.*` only (ideas and drafts about posts), and they are listed one by one
