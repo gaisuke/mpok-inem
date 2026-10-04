@@ -82,10 +82,11 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | POST | `/v1/transfers` | move money between pockets (`from_pocket_id`, `to_pocket_id`, `amount_idr`, `note`); destination may be another member's shared pocket |
 | GET | `/v1/transfers` | transfers (`month`, or `from`/`to`, `pocket_id`, `limit`) — includes moves into/out of your pockets made by the other member |
 | DELETE | `/v1/transfers/{id}` | drop a mistaken transfer |
-| GET/POST | `/v1/schedules` | recurring plans (`?date=`, `?pending=true`) / add one (`kind`, `from_pocket_id`, `to_pocket_id`, `amount_idr` omitted = figure varies, `day_of_month`); destination may be another member's shared pocket |
+| GET/POST | `/v1/schedules` | recurring plans (`?date=`, `?pending=true`) / add one (`kind`, `from_pocket_id`, `to_pocket_id`, `amount_idr` omitted = figure varies, `amount_usd` = priced in dollars, `day_of_month`); destination may be another member's shared pocket |
 | PATCH/DELETE | `/v1/schedules/{id}` | change amount/day/note or pause it / delete a plan |
 | POST | `/v1/schedules/run` | book the confirmed plans once per month (`date`, `entry_date`, `ids`, `amount_idr` for one variable plan, `force`, `mark_only`) |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
+| GET | `/v1/fx` | the day's USD→IDR rate (`pair`, `rate`, `day`, `source`, `stale`) — cached per day, reused and flagged when both providers are unreachable |
 | POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |
 | GET/PATCH/DELETE | `/v1/notes/{id}` | fetch, edit, delete one note |
 | GET | `/v1/notes/search` | full-text search |

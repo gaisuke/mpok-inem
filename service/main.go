@@ -4,11 +4,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -1222,6 +1225,13 @@ type schedule struct {
 	To         string `json:"to"`
 	AmountIDR  *int64 `json:"amount_idr"` // null = the figure varies; ask when booking
 	Variable   bool   `json:"variable"`
+	// A plan priced in dollars (a card subscription): the rupiah figure is only
+	// known on the day, from the day's rate. EstimateIDR is filled for the date
+	// asked about, so the reminder and the booking agree on one number.
+	AmountUSD   *float64 `json:"amount_usd"`
+	EstimateIDR *int64   `json:"estimate_idr"`
+	FXRate      *float64 `json:"fx_rate"`
+	FXStale     bool     `json:"fx_stale"`
 	DayOfMonth int    `json:"day_of_month"`
 	Note       string `json:"note"`
 	Payee      string `json:"payee"`     // kind=expense: who is paid
@@ -1247,7 +1257,7 @@ WITH base AS (
   FROM base b
 )
 SELECT d.id, d.kind, d.from_pocket, COALESCE(pf.name,''), COALESCE(d.to_pocket,0)::int, COALESCE(pt.name,''),
-  d.amount, (d.amount IS NULL), d.day_of_month, COALESCE(d.note,''), d.active,
+  d.amount, (d.amount IS NULL), d.amount_usd::float8, d.day_of_month, COALESCE(d.note,''), d.active,
   to_char($2::date,'YYYY-MM'), d.due_date::text,
   COALESCE(d.payee,''), COALESCE(d.category,''), COALESCE(d.starts_on::text,''), COALESCE(d.ends_on::text,''),
   CASE WHEN d.starts_on IS NOT NULL AND d.due_date < d.starts_on THEN 'not_started'
@@ -1266,13 +1276,166 @@ WHERE ($3::bool IS NOT TRUE)
        AND (d.ends_on IS NULL OR d.due_date <= d.ends_on))
 ORDER BY d.eff_day, d.id`
 
+// ---------- kurs USD ----------
+//
+// A plan can be priced in dollars (a card subscription). The rupiah figure is
+// therefore only known on the day, so the rate is fetched once per day and kept
+// in expense.fx_rates: one day quotes one number, and the reminder, the booking
+// and the dashboard all use it. When both providers are unreachable the last
+// stored rate is reused and flagged stale rather than silently inventing one.
+
+var fxClient = &http.Client{Timeout: 8 * time.Second}
+
+// fxFetch is a package hook so tests answer without touching the network.
+var fxFetch = fetchUSDRate
+
+func pickERApiIDR(body []byte) (float64, error) {
+	var out struct {
+		Rates map[string]float64 `json:"rates"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, err
+	}
+	rate, ok := out.Rates["IDR"]
+	if !ok || rate <= 0 {
+		return 0, fmt.Errorf("IDR tidak ada di respons")
+	}
+	return rate, nil
+}
+
+func pickFloatRatesIDR(body []byte) (float64, error) {
+	var out map[string]struct {
+		Rate float64 `json:"rate"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, err
+	}
+	idr, ok := out["idr"]
+	if !ok || idr.Rate <= 0 {
+		return 0, fmt.Errorf("IDR tidak ada di respons")
+	}
+	return idr.Rate, nil
+}
+
+// fetchUSDRate asks the free providers in order and returns the first answer.
+func fetchUSDRate() (float64, string, error) {
+	for _, p := range []struct {
+		name string
+		url  string
+		pick func([]byte) (float64, error)
+	}{
+		{"exchangerate-api", "https://open.er-api.com/v6/latest/USD", pickERApiIDR},
+		{"floatrates", "https://www.floatrates.com/daily/usd.json", pickFloatRatesIDR},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+		if err != nil {
+			cancel()
+			continue
+		}
+		resp, err := fxClient.Do(req)
+		if err != nil {
+			cancel()
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		cancel()
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+		if rate, err := p.pick(body); err == nil {
+			return rate, p.name, nil
+		}
+	}
+	return 0, "", fmt.Errorf("kedua sumber kurs tidak menjawab")
+}
+
+// usdIDR returns today's rate. stale=true means the providers failed and an
+// older stored rate was used, so the caller must say so out loud.
+func usdIDR() (rate float64, day, source string, stale bool, err error) {
+	today := time.Now().Format("2006-01-02")
+	if err := db.QueryRow(`SELECT rate::float8, source FROM expense.fx_rates
+		WHERE pair='USDIDR' AND day=$1`, today).Scan(&rate, &source); err == nil {
+		return rate, today, source, false, nil
+	}
+	if fresh, src, ferr := fxFetch(); ferr == nil {
+		_, _ = db.Exec(`INSERT INTO expense.fx_rates(day,pair,rate,source)
+			VALUES($1::date,'USDIDR',$2,$3)
+			ON CONFLICT (day,pair) DO UPDATE SET rate=EXCLUDED.rate, source=EXCLUDED.source, fetched_at=now()`,
+			today, fresh, src)
+		return fresh, today, src, false, nil
+	}
+	if err := db.QueryRow(`SELECT rate::float8, day::text, source FROM expense.fx_rates
+		WHERE pair='USDIDR' ORDER BY day DESC LIMIT 1`).Scan(&rate, &day, &source); err == nil {
+		return rate, day, source, true, nil
+	}
+	return 0, "", "", false, fmt.Errorf("kurs USD belum tersedia dan sumbernya tidak bisa dihubungi")
+}
+
+// fillEstimates gives every dollar-priced plan its rupiah figure for today.
+func fillEstimates(list []schedule) []schedule {
+	need := false
+	for _, s := range list {
+		if s.AmountUSD != nil {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return list
+	}
+	rate, _, _, stale, err := usdIDR()
+	if err != nil {
+		return list
+	}
+	for i := range list {
+		if list[i].AmountUSD == nil {
+			continue
+		}
+		est := estimateIDR(*list[i].AmountUSD, rate)
+		r := rate
+		list[i].EstimateIDR = &est
+		list[i].FXRate = &r
+		list[i].FXStale = stale
+	}
+	return list
+}
+
+// trimNum renders a number for a note: a dollar price keeps its cents, a rate is
+// written in whole rupiah.
+func trimNum(f float64) string {
+	if math.Abs(f) >= 1000 {
+		f = math.Round(f)
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+// estimateIDR converts a dollar price into rupiah, rounded to the nearest 100 so
+// the number is the same everywhere and looks like money.
+func estimateIDR(usd, rate float64) int64 {
+	return int64(math.Round(usd*rate/100)) * 100
+}
+
+// getFX: the day's rate, for the agent and the dashboard to quote.
+func getFX(w http.ResponseWriter, r *http.Request, userID int) {
+	rate, day, source, stale, err := usdIDR()
+	if err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"pair": "USDIDR", "rate": rate, "day": day, "source": source, "stale": stale,
+	})
+}
+
 func scanSchedules(rows *sql.Rows) ([]schedule, error) {
 	out := []schedule{}
 	for rows.Next() {
 		var s schedule
 		var from *int
 		if err := rows.Scan(&s.ID, &s.Kind, &from, &s.From, &s.ToPocket, &s.To,
-			&s.AmountIDR, &s.Variable, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate,
+			&s.AmountIDR, &s.Variable, &s.AmountUSD, &s.DayOfMonth, &s.Note, &s.Active, &s.Period, &s.DueDate,
 			&s.Payee, &s.Category, &s.StartsOn, &s.EndsOn, &s.Status); err != nil {
 			return nil, err
 		}
@@ -1303,7 +1466,7 @@ func listSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 		badReq(w, err.Error())
 		return
 	}
-	writeJSON(w, 200, out)
+	writeJSON(w, 200, fillEstimates(out))
 }
 
 func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
@@ -1312,12 +1475,13 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		From       int    `json:"from_pocket_id"`
 		To         int    `json:"to_pocket_id"`
 		Amount     *int64 `json:"amount_idr"`
-		DayOfMonth int    `json:"day_of_month"`
-		Note       string `json:"note"`
-		Payee      string `json:"payee"`
-		Category   string `json:"category"`
-		StartsOn   string `json:"starts_on"`
-		EndsOn     string `json:"ends_on"`
+		AmountUSD  *float64 `json:"amount_usd"` // priced in dollars; converted on the day
+		DayOfMonth int      `json:"day_of_month"`
+		Note       string   `json:"note"`
+		Payee      string   `json:"payee"`
+		Category   string   `json:"category"`
+		StartsOn   string   `json:"starts_on"`
+		EndsOn     string   `json:"ends_on"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		badReq(w, err.Error())
@@ -1354,6 +1518,14 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 	}
 	if in.Amount != nil && *in.Amount <= 0 {
 		badReq(w, "amount_idr must be > 0")
+		return
+	}
+	if in.AmountUSD != nil && *in.AmountUSD <= 0 {
+		badReq(w, "amount_usd must be > 0")
+		return
+	}
+	if in.Amount != nil && in.AmountUSD != nil {
+		badReq(w, "pilih satu nominal: amount_idr atau amount_usd, bukan dua-duanya")
 		return
 	}
 	if in.DayOfMonth < 1 || in.DayOfMonth > 31 {
@@ -1433,9 +1605,9 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 		endsOn = in.EndsOn
 	}
 	var id int64
-	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,day_of_month,note,payee,category,starts_on,ends_on)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11::date) RETURNING id`,
-		userID, in.Kind, from, to, in.Amount, in.DayOfMonth, in.Note, payee, category, startsOn, endsOn).Scan(&id)
+	err := db.QueryRow(`INSERT INTO expense.schedules(user_id,kind,from_pocket,to_pocket,amount,amount_usd,day_of_month,note,payee,category,starts_on,ends_on)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date) RETURNING id`,
+		userID, in.Kind, from, to, in.Amount, in.AmountUSD, in.DayOfMonth, in.Note, payee, category, startsOn, endsOn).Scan(&id)
 	if err != nil {
 		badReq(w, err.Error())
 		return
@@ -1445,9 +1617,10 @@ func createSchedule(w http.ResponseWriter, r *http.Request, userID int) {
 
 func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 	var in struct {
-		Amount     *int64  `json:"amount_idr"`
-		Variable   *bool   `json:"variable"`
-		DayOfMonth *int    `json:"day_of_month"`
+		Amount     *int64   `json:"amount_idr"`
+		AmountUSD  *float64 `json:"amount_usd"` // >0 = price it in dollars; 0 = clear that
+		Variable   *bool    `json:"variable"`
+		DayOfMonth *int     `json:"day_of_month"`
 		Note       *string `json:"note"`
 		Active     *bool   `json:"active"`
 		Payee      *string `json:"payee"`
@@ -1468,10 +1641,27 @@ func updateSchedule(w http.ResponseWriter, r *http.Request, userID, id int) {
 		}
 		args = append(args, *in.Amount)
 		sets = append(sets, fmt.Sprintf("amount=$%d", len(args)))
+		// one price, never two: a rupiah figure replaces a dollar one
+		sets = append(sets, "amount_usd=NULL")
+	}
+	if in.AmountUSD != nil {
+		if *in.AmountUSD < 0 {
+			badReq(w, "amount_usd must be >= 0 (0 clears it)")
+			return
+		}
+		if *in.AmountUSD == 0 {
+			sets = append(sets, "amount_usd=NULL")
+		} else {
+			args = append(args, *in.AmountUSD)
+			sets = append(sets, fmt.Sprintf("amount_usd=$%d", len(args)))
+			// a dollar price means the rupiah figure comes from the day's rate
+			sets = append(sets, "amount=NULL")
+		}
 	}
 	if in.Variable != nil && *in.Variable {
-		// the figure varies month to month: clear it so booking asks instead of assuming
-		sets = append(sets, "amount=NULL")
+		// the figure varies month to month: clear both so booking asks instead
+		// of assuming (or converting)
+		sets = append(sets, "amount=NULL", "amount_usd=NULL")
 	}
 	if in.DayOfMonth != nil {
 		if *in.DayOfMonth < 1 || *in.DayOfMonth > 31 {
@@ -1667,6 +1857,20 @@ func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 		if in.Amount != nil && int64(s.ID) == int64(in.IDs[0]) {
 			amount = in.Amount
 		}
+		// A plan priced in dollars carries no rupiah figure: take the day's rate.
+		// The rate goes into the note so the entry explains itself later, and a
+		// stale rate says so instead of pretending to be today's.
+		fxNote := ""
+		if amount == nil && s.AmountUSD != nil {
+			if rate, _, _, stale, err := usdIDR(); err == nil {
+				est := estimateIDR(*s.AmountUSD, rate)
+				amount = &est
+				fxNote = fmt.Sprintf("USD %s × kurs %s", trimNum(*s.AmountUSD), trimNum(rate))
+				if stale {
+					fxNote += " (kurs terakhir tersimpan)"
+				}
+			}
+		}
 		if amount == nil {
 			skipped = append(skipped, map[string]any{"schedule_id": s.ID,
 				"reason": "nominal belum diisi — sebutkan berapa yang benar-benar pindah bulan ini"})
@@ -1685,6 +1889,13 @@ func runSchedules(w http.ResponseWriter, r *http.Request, userID int) {
 			}
 		}
 		note := s.Note
+		if fxNote != "" {
+			if strings.TrimSpace(note) == "" {
+				note = fxNote
+			} else {
+				note = note + " (" + fxNote + ")"
+			}
+		}
 		entryDate := s.DueDate
 		if in.EntryDate != "" {
 			entryDate = in.EntryDate
@@ -2453,6 +2664,7 @@ func allRoutes() []route {
 
 		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
 		{"GET", "/v1/household", withUser(household)},
+		{"GET", "/v1/fx", withUser(getFX)},
 
 		{"GET", "/v1/schedules", withUser(listSchedules)},
 		{"POST", "/v1/schedules", withUser(createSchedule)},

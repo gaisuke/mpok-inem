@@ -341,3 +341,34 @@ stream (or a screenshot) would have published them.
 Consequences: one click before going live, one click after. Two tests pin it —
 the passthrough and the pocket-detail merge, which builds its own JSON and would
 otherwise have missed the mask.
+
+## D16 — A plan can be priced in dollars, and the rate is taken once a day (2026-10-04)
+
+Context: the AI subscription is billed to a card as $10 + tax = $11, so the
+rupiah figure is not knowable when the plan is written — and the bank's rate is
+not the market's: the first charge (Rp186.568 on 4 Oct) worked out around
+16.960/USD, a few percent off the market's 17.889. Which is the argument for
+recording the rupiah that actually left, and for quoting the rate it came from.
+
+- **`schedules.amount_usd`** carries the dollar price; `amount` stays NULL for
+  such a plan, and a CHECK keeps the two mutually exclusive. A price is one
+  number, never two.
+- **One rate per day, cached in `expense.fx_rates`.** Two free providers are tried
+  in order (open.er-api.com, then floatrates) and the answer is stored with the
+  day it belongs to, so the reminder, the booking and the dashboard cannot quote
+  three different figures for the same charge.
+- **When no provider answers, the last stored rate is reused and flagged
+  `stale`** — the reminder prints it as "kurs lama" and the entry's note says so.
+  An old number a human can correct beats an invented one nobody can.
+- **Booking needs no figure from the human**: `run` converts the price with the
+  day's rate and writes the conversion into the note ("USD 11 × kurs 17889"), so
+  the entry explains itself a month later. An explicit amount still wins: the
+  bank's figure is the truth, the estimate is only a forecast.
+- **The estimate is rounded to the nearest 100 rupiah** so the same number shows
+  up everywhere, and `GET /v1/fx` + the CLI's `fx` let the agent answer "kurs
+  hari ini berapa?" without a web search.
+
+Consequences: plan [14] is the OpenCode subscription (USD 11, day 4, from eCard).
+October was marked settled — the real charge was already recorded as an ordinary
+transaction — so the plan only starts asking from 4 November, quoting the
+morning's rate each month.
