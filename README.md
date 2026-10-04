@@ -86,7 +86,7 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | PATCH/DELETE | `/v1/schedules/{id}` | change amount/day/note or pause it / delete a plan |
 | POST | `/v1/schedules/run` | book the confirmed plans once per month (`date`, `entry_date`, `ids`, `amount_idr` for one variable plan, `force`, `mark_only`) |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
-| GET | `/v1/fx` | the day's USD→IDR rate (`pair`, `rate`, `day`, `source`, `stale`) — cached per day, reused and flagged when both providers are unreachable |
+| GET/POST | `/v1/fx` | the day's USD→IDR rate (`pair`, `rate`, `day`, `source`, `stale`) — cached per day, reused and flagged when both providers are unreachable; POST records one (i.e. a bank's own published rate) and a recorded rate wins for that day |
 | POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |
 | GET/PATCH/DELETE | `/v1/notes/{id}` | fetch, edit, delete one note |
 | GET | `/v1/notes/search` | full-text search |

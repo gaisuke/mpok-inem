@@ -1418,6 +1418,56 @@ func estimateIDR(usd, rate float64) int64 {
 }
 
 // getFX: the day's rate, for the agent and the dashboard to quote.
+// postFX records a rate for a pair and a day. It exists because the best source
+// is a bank's own page, and a bank page can be unreachable from this host (Jago's
+// sits behind Cloudflare, which blocks this IP): whoever can read it — the agent,
+// with its own fetcher — stores the number here, and the rest of the system keeps
+// working from the cache. No provider is asked again for a day that already has a
+// rate, so the stored number wins.
+func postFX(w http.ResponseWriter, r *http.Request, userID int) {
+	var in struct {
+		Pair   string  `json:"pair"`
+		Rate   float64 `json:"rate"`
+		Source string  `json:"source"`
+		Day    string  `json:"day"` // optional; default today
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	if in.Pair == "" {
+		in.Pair = "USDIDR"
+	}
+	if strings.ToUpper(in.Pair) != "USDIDR" {
+		badReq(w, "pair must be USDIDR for now")
+		return
+	}
+	if in.Rate <= 0 {
+		badReq(w, "rate must be > 0")
+		return
+	}
+	day := in.Day
+	if day == "" {
+		day = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", day); err != nil {
+		badReq(w, "day must be YYYY-MM-DD")
+		return
+	}
+	if in.Source == "" {
+		in.Source = "manual"
+	}
+	if _, err := db.Exec(`INSERT INTO expense.fx_rates(day,pair,rate,source)
+		VALUES($1::date,'USDIDR',$2,$3)
+		ON CONFLICT (day,pair) DO UPDATE SET rate=EXCLUDED.rate, source=EXCLUDED.source, fetched_at=now()`,
+		day, in.Rate, in.Source); err != nil {
+		badReq(w, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"pair": "USDIDR", "rate": in.Rate, "day": day,
+		"source": in.Source, "stale": false})
+}
+
 func getFX(w http.ResponseWriter, r *http.Request, userID int) {
 	rate, day, source, stale, err := usdIDR()
 	if err != nil {
@@ -2665,6 +2715,7 @@ func allRoutes() []route {
 		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
 		{"GET", "/v1/household", withUser(household)},
 		{"GET", "/v1/fx", withUser(getFX)},
+		{"POST", "/v1/fx", withUser(postFX)},
 
 		{"GET", "/v1/schedules", withUser(listSchedules)},
 		{"POST", "/v1/schedules", withUser(createSchedule)},

@@ -372,3 +372,35 @@ Consequences: plan [14] is the OpenCode subscription (USD 11, day 4, from eCard)
 October was marked settled — the real charge was already recorded as an ordinary
 transaction — so the plan only starts asking from 4 November, quoting the
 morning's rate each month.
+
+## D17 — The best rate is the bank's, and the bank's page may be unreachable (2026-10-04)
+
+Context: the subscription is charged to a Jago card, so Jago's own rate is the
+honest one to quote. Jago does publish it — "Kurs Mata Uang Asing Nasabah Jago"
+on `jago.com/id/jago/digital/pocket/foreign-currency`, with a timestamp, e.g.
+4 Oct 19:30 WIB: USD **Nasabah Beli 17.892 / Nasabah Jual 17.872** (buy when you
+buy dollars, sell when you sell).
+
+- **That page cannot be read from this host.** Cloudflare answers 403 to curl and
+  to headless Chrome alike (datacenter IP, the same wall that blocked the profx
+  retrieval vendor), and the free text relays tried (r.jina.ai, codetabs,
+  allorigins, corsproxy) are blocked or useless too. The rule: never build a
+  dependency on a page this host cannot fetch.
+- **So the rate can be pushed in instead.** `POST /v1/fx` records a rate for a
+  pair and a day, and a day that already has a stored rate is never re-fetched:
+  whoever *can* read the bank's page (the agent, through its own fetcher) stores
+  the number, and the rest of the system reads it from the cache. The provider
+  fetch stays as the fallback, so a missing push degrades to a market rate rather
+  than to nothing.
+- **Jago's spread is tiny**: 17.872/17.892 against a market 17.889 — the estimate
+  moves by ~Rp20 on a Rp196.800 charge. Which is why this stays a manual/agent
+  push instead of a daily model call: the accuracy bought is smaller than the
+  machinery.
+- **The published FX rate is not the card rate.** The first charge (Rp186.568)
+  works out to ~16.961/USD at $11, i.e. neither Jago's counter rate nor the
+  market's — the receipt is the truth and the estimate is a forecast. The booking
+  flow already lets the real figure win.
+
+Consequences: `inem.py fx --set 17892 --source jago` records the bank's rate for
+the day; the reminder then quotes Jago's number, and the falling back stays
+automatic.

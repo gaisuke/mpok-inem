@@ -103,6 +103,7 @@ func newAPI(t *testing.T) *apiTest {
 	t.Helper()
 	c := conn(t)
 	if _, err := c.Exec(`TRUNCATE inem_auth.users, expense.pockets, expense.transactions, expense.transfers,
+		expense.fx_rates,
 		brain.notes, brain.note_links, nutrition.meals, nutrition.meal_items, nutrition.daily_targets,
  content.topics, content.drafts, content.runs
  RESTART IDENTITY CASCADE`); err != nil {
