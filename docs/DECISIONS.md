@@ -404,3 +404,38 @@ buy dollars, sell when you sell).
 Consequences: `inem.py fx --set 17892 --source jago` records the bank's rate for
 the day; the reminder then quotes Jago's number, and the falling back stays
 automatic.
+
+## D18 — A forecast that separates habits from events (2026-10-11)
+
+Context: the household wanted to know what next month will cost, and — more
+usefully — *which parts of this month will never happen again*. A phone bought
+once must not make next month look expensive, and a coffee bought every day must
+not be forgotten because it is small.
+
+- **Habit = the median, not the mean.** One 9,3jt month drags a mean far away
+  from what a normal month costs; the median of the monthly totals is the number
+  a budget can act on.
+- **A category seen in one of three months is amortised, not dropped**: Rp300rb
+  every third month is Rp100rb a month. Treating it as zero is how a budget lies.
+- **An event must clear two bars**: `>= Rp1.000.000` *and* `>= 3×` the person's
+  normal entry size. One bar alone is wrong in both directions — 300rb a year is
+  not a phone, and a 600rb month is not an event.
+- **A thin category never judges itself.** With fewer than three entries in a
+  category, the yardstick is the median of *all* entries that month-window; a
+  phone bought once would otherwise define "normal" for its own category and hide
+  itself (this bug was caught by the test, not by review).
+- **Events are excluded but never hidden**: they are listed with their amount,
+  note and a plain-language reason, so the money is still accounted for while the
+  forecast stays honest.
+- **The window is completed months only** (default 3, 1..6), because the current
+  month is still being written.
+- **Everyone in the household is forecast, through the same visibility rules as
+  the ledger**: the caller sees their own pockets in full, another member's only
+  through what they shared. A private pocket never leaks into a forecast.
+- **Plans are shown next to the guess**, because a scheduled transfer is a
+  commitment rather than an estimate — the two must not be added up as if they
+  were the same kind of number.
+
+Consequences: `GET /v1/expense/forecast?month=YYYY-MM&months=N`, `inem.py
+forecast`, and a "Ramalan" tab in the dashboard that renders it (money fields all
+end in `_idr`, so privacy mode masks the whole tab as it does the rest).

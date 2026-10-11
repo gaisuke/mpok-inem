@@ -86,6 +86,7 @@ Telegram user to a `inem_auth.users.id` first); `/internal/v1/handle` takes
 | PATCH/DELETE | `/v1/schedules/{id}` | change amount/day/note or pause it / delete a plan |
 | POST | `/v1/schedules/run` | book the confirmed plans once per month (`date`, `entry_date`, `ids`, `amount_idr` for one variable plan, `force`, `mark_only`) |
 | GET | `/v1/expense/summary` | totals + pocket balances (`month`, or `from`/`to`) |
+| GET | `/v1/expense/forecast` | next month's likely cost, built from completed months (`month`, `months` 1..6): per-category median habits, amortised rare categories, one-off events excluded but named, plus the month's scheduled commitments |
 | GET/POST | `/v1/fx` | the day's USD→IDR rate (`pair`, `rate`, `day`, `source`, `stale`) — cached per day, reused and flagged when both providers are unreachable; POST records one (i.e. a bank's own published rate) and a recorded rate wins for that day |
 | POST/GET | `/v1/notes` | capture / list notes (`tag`, `limit`) |
 | GET/PATCH/DELETE | `/v1/notes/{id}` | fetch, edit, delete one note |
@@ -163,6 +164,9 @@ non-GET routes — none of them can reach inemd, so the data path stays read-onl
 - **The ledger has no write path**: apart from the content routes below, only GET
   routes are registered, so a stray POST/PATCH/DELETE answers 405 and never
   reaches inemd. Nothing on the internet-facing page can move money.
+- The **Ramalan** tab renders `/v1/expense/forecast`: what next month likely costs,
+  split into habits (median per category, rare ones amortised) and the events that
+  will not repeat (named, with a reason), plus the month's scheduled commitments.
 - **Mode privasi** (`GET/POST /api/privacy`, or `INEM_DASH_PRIVACY=1` to force it
   on): every rupiah figure is blanked **before it leaves this process** — the
   passthrough and `writeJSON` turn each `*_idr` value into `null`, and the page

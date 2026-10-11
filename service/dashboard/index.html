@@ -95,6 +95,7 @@
     <button data-tab="transaksi">Transaksi</button>
     <button data-tab="rumah">Rumah tangga</button>
     <button data-tab="jadwal">Jadwal</button>
+    <button data-tab="ramalan">Ramalan</button>
     <button data-tab="notes">Notes</button>
     <button data-tab="meals">Meals</button>
     <button data-tab="ide">Ide</button>
@@ -188,6 +189,20 @@
       <button class="act" id="jd-refresh">Muat ulang</button>
     </div>
     <ul id="schedules"></ul>
+  </section>
+
+  <!-- Ramalan: tebakan bulan depan dari apa yang benar-benar terjadi —
+       kebiasaan (median per kategori) dan peristiwa sekali yang dikeluarkan
+       dari pola. Ini hitungan, bukan perintah; uang tetap baca-saja. -->
+  <section id="ramalan">
+    <div class="row">
+      <button class="act" id="fc-refresh">Muat ulang</button>
+      <span class="meta">tebakan dari bulan-bulan sebelumnya, bukan angka pasti</span>
+    </div>
+    <div id="fc-head"></div>
+    <div id="fc-members"></div>
+    <h2>Komitmen bulan itu</h2>
+    <ul id="fc-plans"></ul>
   </section>
 
   <section id="notes">
@@ -432,6 +447,51 @@ async function loadSchedules() {
         ${s.note ? ' · ' + esc(s.note) : ''}</div></li>`;
     }).join('');
   } catch (e) { fail(ul, e.message); }
+}
+
+// Ramalan: tebakan bulan yang akan datang — kebiasaan (median per kategori,
+// yang muncul tiap bulan) dan peristiwa sekali yang dikeluarkan dari pola.
+// Setiap nominal lewat num(), jadi mode privasi tetap menyembunyikannya.
+async function loadForecast() {
+  const box = $('fc-members'), plans = $('fc-plans');
+  plans.innerHTML = '';
+  try {
+    const d = await api('/api/forecast');
+    $('fc-head').innerHTML = `<h2>Ramalan ${esc(d.month)} <span class="meta">dasar: ${esc((d.based_on || []).join(', '))}</span></h2>`;
+    const members = d.members || [];
+    if (!members.length) {
+      box.innerHTML = '<p class="empty">belum ada transaksi untuk diramal</p>';
+    } else {
+      box.innerHTML = members.map(m => {
+        const cats = m.categories || [], oneOff = m.one_off || [], hints = m.hints || [];
+        return `
+        <h2>${esc(m.name)}${m.me ? ' <span class="pill">kamu</span>' : ''}</h2>
+        <ul>
+          <li><div class="top"><span class="name">ramalan belanja</span>
+            <span class="amt out">${num(m.spend_forecast_idr)}</span></div>
+            <div class="meta">median bulanan ${num(m.spend_median_idr)} · dari ${esc((m.history_months || []).length)} bulan</div></li>
+          ${cats.length ? cats.map(c => `
+          <li><div class="top"><span class="name">${esc(c.category)}</span>
+            <span class="amt out">${num(c.forecast_idr)}</span></div>
+            <div class="meta"><span class="pill">${esc(c.pattern)}</span>${esc(c.months_seen)}/${esc(c.window)} bulan · ${esc(c.entries)} catatan · median ${num(c.median_month_idr)}</div></li>`).join('')
+          : '<li class="empty">belum ada pengeluaran berulang</li>'}
+        </ul>
+        ${oneOff.length ? `<h2>Sekali ini saja</h2><ul>${oneOff.map(e => `
+          <li><div class="top"><span class="name">${esc(e.note || e.category)}</span>
+            <span class="amt out">${num(e.amount_idr)}</span></div>
+            <div class="meta">${esc((e.date || '').slice(0, 10))} · <span class="pill">${esc(e.category)}</span>${e.pocket ? '<span class="pill">' + esc(e.pocket) + '</span>' : ''}</div>
+            <div class="body">${esc(e.why)}</div></li>`).join('')}</ul>` : ''}
+        ${hints.length ? '<div class="meta">' + hints.map(h => '💡 ' + esc(h)).join('<br>') + '</div>' : ''}`;
+      }).join('');
+    }
+    const ps = d.plans || [];
+    if (!ps.length) return empty(plans, 'belum ada komitmen tercatat untuk bulan itu');
+    plans.innerHTML = ps.map(p => `
+      <li><div class="top">
+        <span class="name">${esc(p.label)}</span>
+        <span class="amt">${p.variable ? 'nominal menyusul' : num(p.amount_idr)}</span>
+      </div><div class="meta">tgl ${esc(p.day_of_month)} · <span class="pill">${esc(p.kind)}</span></div></li>`).join('');
+  } catch (e) { fail(box, e.message); }
 }
 
 async function loadNotes() {
@@ -712,6 +772,7 @@ function showTab(name) {
   if (name === 'pocket' && currentPocket) openPocket(currentPocket, $('pd-period').value);
   if (name === 'rumah') loadHousehold();
   if (name === 'jadwal') loadSchedules();
+  if (name === 'ramalan') loadForecast();
   if (name === 'transaksi') { loadTxns(); loadTransfers(); }
   if (name === 'notes') loadNotes();
   if (name === 'meals') loadMeals();
@@ -739,6 +800,7 @@ $('pd-period').addEventListener('change', () => openPocket(currentPocket, $('pd-
 $('refresh').addEventListener('click', () => { loadSummary(); loadPockets(); });
 $('txn-refresh').addEventListener('click', () => { loadTxns(); loadTransfers(); });
 $('jd-refresh').addEventListener('click', loadSchedules);
+$('fc-refresh').addEventListener('click', loadForecast);
 $('note-refresh').addEventListener('click', loadNotes);
 $('note-q').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });
 $('note-tag').addEventListener('keydown', e => { if (e.key === 'Enter') loadNotes(); });

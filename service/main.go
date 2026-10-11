@@ -2714,6 +2714,7 @@ func allRoutes() []route {
 
 		{"GET", "/v1/expense/summary", withUser(expenseSummary)},
 		{"GET", "/v1/household", withUser(household)},
+		{"GET", "/v1/expense/forecast", withUser(expenseForecast)},
 		{"GET", "/v1/fx", withUser(getFX)},
 		{"POST", "/v1/fx", withUser(postFX)},
 

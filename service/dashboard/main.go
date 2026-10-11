@@ -65,6 +65,7 @@ func (s *server) handler() http.Handler {
 
 	mux.HandleFunc("GET /api/pockets", s.authed(s.pass("/v1/pockets", nil)))
 	mux.HandleFunc("GET /api/summary", s.authed(s.pass("/v1/expense/summary", periodQuery)))
+	mux.HandleFunc("GET /api/forecast", s.authed(s.pass("/v1/expense/forecast", forecastQuery)))
 	mux.HandleFunc("GET /api/txns", s.authed(s.pass("/v1/transactions", func(r *http.Request) (string, error) {
 		q, err := periodQuery(r)
 		if err != nil {
@@ -681,6 +682,31 @@ func limitOr(r *http.Request, def, max string) string {
 		return max
 	}
 	return fmt.Sprint(n)
+}
+
+// forecastQuery forwards the two knobs the forecast takes: which month to guess
+// and how many months to learn from. inemd validates both too; checking here as
+// well keeps a typo from looking like an empty forecast in the page.
+func forecastQuery(r *http.Request) (string, error) {
+	q := r.URL.Query()
+	parts := []string{}
+	if m := strings.TrimSpace(q.Get("month")); m != "" {
+		if !validMonth(m) {
+			return "", fmt.Errorf("month must be YYYY-MM")
+		}
+		parts = append(parts, "month="+m)
+	}
+	if v := strings.TrimSpace(q.Get("months")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 6 {
+			return "", fmt.Errorf("months must be 1..6")
+		}
+		parts = append(parts, "months="+strconv.Itoa(n))
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return "?" + strings.Join(parts, "&"), nil
 }
 
 // periodQuery mirrors the skill's period vocabulary: today|yesterday|week|
